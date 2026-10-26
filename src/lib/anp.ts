@@ -294,20 +294,65 @@ export function signDidDocumentProof(
   const withoutProof: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(doc)) if (k !== 'proof') withoutProof[k] = v
 
-  // The ANP SDK's eddsa-jcs-2022 verifier folds the document's @context into
-  // the proof configuration for multibase (z…) proofValue; sign the same bytes.
-  // The proof object itself still carries only the standard proof fields.
-  const proofConfig = { ...proofOptions }
-  if (withoutProof['@context'] !== undefined) proofConfig['@context'] = withoutProof['@context']
+  const signature = ed25519.sign(didDocumentProofPayload(proofOptions, withoutProof, true), priv)
+  // awiki.ai's DID verifier expects a multibase base58-btc proofValue, not base64url.
+  return { ...proofOptions, proofValue: 'z' + base58.encode(signature) }
+}
 
+/**
+ * The 64 bytes signed by eddsa-jcs-2022: sha256(jcs(proofConfig)) || sha256(jcs(doc)).
+ *
+ * The W3C cryptosuite (and awiki's signer) folds the document's `@context` into
+ * the proof configuration. Some relying parties verify without that fold, so the
+ * caller picks which payload it is producing.
+ */
+function didDocumentProofPayload(
+  proofOptions: Record<string, unknown>,
+  withoutProof: Record<string, unknown>,
+  foldContext: boolean,
+): Uint8Array {
+  let proofConfig = proofOptions
+  if (foldContext && withoutProof['@context'] !== undefined) {
+    proofConfig = { ...proofOptions, '@context': withoutProof['@context'] }
+  }
   const optionsHash = sha256(utf8ToBytes(jcsCanonicalize(proofConfig)))
   const docHash = sha256(utf8ToBytes(jcsCanonicalize(withoutProof)))
   const toBeSigned = new Uint8Array(64)
   toBeSigned.set(optionsHash, 0)
   toBeSigned.set(docHash, 32)
-  const signature = ed25519.sign(toBeSigned, priv)
-  // awiki.ai's DID verifier expects a multibase base58-btc proofValue, not base64url.
-  return { ...proofOptions, proofValue: 'z' + base58.encode(signature) }
+  return toBeSigned
+}
+
+/**
+ * The same DID document with its top-level proof re-made for an ANP login body.
+ *
+ * agentworld's login verifier (@connectx-sdk) checks the inline document proof
+ * WITHOUT folding `@context` into the proof configuration — the shape awiki's
+ * own published documents use fails there. Document content, DID and key stay
+ * identical; only the proof is refreshed, so the DID's `e1_` fingerprint still
+ * binds the same key. Registration keeps `signDidDocumentProof` (folded).
+ */
+export function reproofDidDocumentForAnpLogin(
+  doc: Record<string, unknown>,
+  priv: Uint8Array,
+  keyid: string,
+): Record<string, unknown> {
+  const old = (doc.proof ?? {}) as Record<string, unknown>
+  const withoutProof: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(doc)) if (k !== 'proof') withoutProof[k] = v
+
+  const proofOptions: Record<string, unknown> = {
+    type: 'DataIntegrityProof',
+    created: isoUtcNow(),
+    verificationMethod: keyid,
+    proofPurpose: 'assertionMethod',
+    cryptosuite: 'eddsa-jcs-2022',
+  }
+  if (old.domain !== undefined) proofOptions.domain = old.domain
+  if (old.challenge !== undefined) proofOptions.challenge = old.challenge
+
+  const signature = ed25519.sign(didDocumentProofPayload(proofOptions, withoutProof, false), priv)
+  return { ...withoutProof, proof: { ...proofOptions, proofValue: 'z' + base58.encode(signature) } }
 }
 
 /** Derived key index → SLIP-0010 path. */

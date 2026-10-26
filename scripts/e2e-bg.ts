@@ -515,6 +515,40 @@ function assertDocumentProof(doc: Record<string, unknown>): void {
   assert(ed25519.verify(signature, input, publicKey.slice(2)), 'document proof verifies over the manifest')
 }
 
+/**
+ * Relying-party verifiers (agentworld's @connectx-sdk/core among them) hash the
+ * proof options WITHOUT folding @context, unlike the awiki registration proof.
+ * The login body must carry a document proof they accept.
+ */
+function assertLoginBodyProof(doc: Record<string, unknown>): void {
+  const proof = must(doc.proof as Record<string, unknown> | undefined, 'login document proof')
+  const proofValue = String(proof.proofValue)
+  assert(proofValue.startsWith('z'), 'login proofValue is base58btc multibase')
+  const vm = must(
+    (doc.verificationMethod as Record<string, unknown>[]).find(
+      (m) => m.id === proof.verificationMethod,
+    ),
+    'login proof verification method resolves',
+  )
+  const publicKey = decodeMultibase(vm.publicKeyMultibase, 'login proof key')
+
+  const { proofValue: _proofValue, ...proofFields } = proof
+  const unsigned: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(doc)) if (key !== 'proof') unsigned[key] = value
+  const signature = base58.decode(proofValue.slice(1))
+  const docHash = sha256(utf8ToBytes(jcsCanonicalize(unsigned)))
+  const check = (options: Record<string, unknown>) => {
+    const input = new Uint8Array(64)
+    input.set(sha256(utf8ToBytes(jcsCanonicalize(options))), 0)
+    input.set(docHash, 32)
+    return ed25519.verify(signature, input, publicKey.slice(2))
+  }
+  assert(check(proofFields), 'login document proof verifies without folding @context')
+  const folded = { ...proofFields }
+  if (unsigned['@context'] !== undefined) folded['@context'] = unsigned['@context']
+  assert(!check(folded), 'login document proof is not the registration (folded) proof')
+}
+
 async function bg<T = any>(msg: Record<string, unknown>): Promise<T> {
   return (await chrome.runtime.sendMessage(msg)) as T
 }
@@ -1122,7 +1156,10 @@ async function main() {
   const deliveredA = must(tabMessages.find((m) => m.id === 'req-1'), 'delivered mnemonic signature')
   eq((deliveredA.result as { did: string }).did, regA.did, 'mnemonic signature uses registered DID')
   const bodyA = JSON.parse((deliveredA.result as { body: string }).body)
+  eq(bodyA.did, regA.did, 'delivered body binds the signing DID')
   eq(bodyA.didDocument.id, regA.did, 'delivered body carries the signing DID document')
+  assertLoginBodyProof(bodyA.didDocument)
+  eq(bodyA.nonce, nonce, 'delivered body keeps the site nonce')
 
   // An open side panel acknowledges the ping, so no extra window is opened.
   const popupCallsBefore = openPopupCalls
@@ -1154,6 +1191,10 @@ async function main() {
     (deliveredSel.result as { didDocument: { id: string } }).didDocument.id === verifiedBDid,
     'self-selected body is re-written for the imported key',
   )
+  const selBody = JSON.parse((deliveredSel.result as { body: string }).body)
+  eq(selBody.did, verifiedBDid, 'self-selected body binds the imported DID')
+  eq(selBody.didDocument.id, verifiedBDid, 'self-selected body document matches the imported DID')
+  assertLoginBodyProof(selBody.didDocument)
   console.log('signing (mnemonic + imported): ok')
 
   // =========================================================================

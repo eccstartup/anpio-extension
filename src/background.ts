@@ -10,6 +10,7 @@ import {
   deriveKeyPrivateKey,
   buildAwikiIdentity,
   buildHandleAggregateDoc,
+  reproofDidDocumentForAnpLogin,
   signAnpLoginRequest,
   signChallenge,
   isValidMnemonic,
@@ -1878,13 +1879,15 @@ async function approve(
   }
   if (!identity) return { status: 'error', error: '尚未注册 DID，请先在钱包里注册' }
 
-  // The site pre-builds the request body with the ACTIVE key's didDocument. If the
-  // user self-selected a DIFFERENT key to sign, that body's didDocument won't match
-  // the signer's keyid, so rebuild the body with the actual signing key's document.
+  // The site pre-builds the request body with the ACTIVE key's didDocument, and
+  // (agentworld's extension connector) without `did` at all. Relying-party
+  // verifiers bind keyid → DID → body.did, and check the inline document's proof
+  // with their own eddsa-jcs-2022 payload, so rebuild both from the signing key.
   let finalBody = item.req.body
   try {
-    const parsed = JSON.parse(item.req.body) as { didDocument?: unknown }
-    parsed.didDocument = identity.didDocument
+    const parsed = JSON.parse(item.req.body) as { did?: unknown; didDocument?: unknown }
+    parsed.did = identity.did
+    parsed.didDocument = reproofDidDocumentForAnpLogin(identity.didDocument, priv, identity.keyid)
     finalBody = JSON.stringify(parsed)
   } catch {
     /* non-JSON body — sign it as-is */
