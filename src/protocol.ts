@@ -45,56 +45,103 @@ export interface PendingRequest {
   pageOrigin: string
 }
 
+// ---------------------------------------------------------------------------
+// Registration servers
+// ---------------------------------------------------------------------------
+
 /**
- * A single key = a single independent DID. Slip-0010-derived from the *wallet's*
- * own mnemonic at `m/44'/0'/<index>'`, so each key within a wallet is a distinct
- * DID (signing keypair). `index` is the derivation path index — NOT an array
- * position. `activeKeyIndex` / handler `keyIndex` args are array positions.
+ * `did_document` is the awiki.ai production contract: one DID document bound to
+ * one handle. `aggregate` is the older local open-server flow kept only for
+ * wallets migrated from v4.
+ */
+export type RegisterMode = 'did_document' | 'aggregate'
+
+export interface ServerConfig {
+  id: string
+  label: string
+  /** RPC root URL without a trailing slash, e.g. https://awiki.ai. */
+  rpcBase: string
+  /** DID authority, e.g. awiki.ai. Must match the discovered document's id. */
+  didDomain: string
+  /** Internal/migration hint; new servers are always did_document. */
+  registerMode?: RegisterMode
+  builtin?: boolean
+}
+
+export interface ServerRegistry {
+  version: 1
+  servers: ServerConfig[]
+  defaultServerId: string
+}
+
+export interface DiscoveredServer {
+  didDomain: string
+  /** The ANPMessageService descriptor copied verbatim from .well-known/did.json. */
+  service: Record<string, unknown>
+  source: 'well-known' | 'fallback'
+}
+
+// ---------------------------------------------------------------------------
+// Wallet storage (v5)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single key = a single independent DID. For mnemonic wallets it is derived
+ * from the wallet's mnemonic at `m/44'/0'/<index>'`; for imported wallets it was
+ * supplied directly. `index` is monotonic and never reused after a delete.
  */
 export interface StoredKey {
-  /** SLIP-0010 path index, monotonic and never reused after a delete. */
+  /** Mnemonic wallets: derivation path index. Imported wallets: import order. */
   index: number
-  /** Full handle name claimed on the server during registration. */
+  /** Full handle claimed on the server during registration. */
   handle: string
   did: string
   keyid: string
   publicKeyMultibase: string
   didDocument: Record<string, unknown>
-  /** Set once the server confirms the handle→DID binding. */
+  /** Set once the server confirms this key's DID/handle binding. */
   registered?: boolean
-  accessToken?: string
 }
 
+export type WalletKind = 'mnemonic' | 'imported'
+
 /**
- * A wallet = one independent mnemonic in its own encrypted blob (under the one
- * global wallet password). It owns one handle and derives many keys (DIDs).
+ * A wallet owns exactly one secret source: a BIP39 mnemonic or an imported set
+ * of Ed25519 seeds. Both are encrypted in one blob under the global password.
  */
 export interface Wallet {
+  kind: WalletKind
   id: string
   /** Display label, e.g. `钱包 1` / `工作`. */
   label: string
-  /** The single handle this wallet corresponds to. */
+  /** Full handle this wallet claims, or empty until registration. */
   handle: string
-  // This wallet's mnemonic, encrypted under the ONE global password:
+  // Encrypted secret (mnemonic string or imported-key JSON):
   salt: string
   iv: string
   ciphertext: string
-  /** Monotonic per-wallet derivation-index source; never decremented on delete. */
+  /** Monotonic per-wallet index source; never decremented on delete. */
   nextKeyIndex: number
   /** Array position of the default signing key within `keys`. */
   activeKeyIndex: number
   /** Array position of the PRIMARY (owner/master) key within `keys`. The primary
-   *  registers the handle against the server and cannot be deleted. */
+   *  registers the handle and cannot be deleted. */
   primaryKeyIndex: number
   keys: StoredKey[]
-  /** Set once the handle's aggregate ad.json has been submitted to the server. */
+  /** Set once the handle has been registered on the bound server. */
   registered?: boolean
-  /** The last aggregate `ad.json` submitted for this handle (display/provenance). */
+  /** The last submitted DID document (did_document) or aggregate ad.json. */
   handleDocuments?: Record<string, unknown>
+  /** Bound registration server; null for legacy localhost wallets. */
+  serverId: string | null
+  /** DID authority used to build this wallet's DIDs. */
+  didDomain: string
+  /** Defaults to did_document; aggregate only for migrated v4 wallets. */
+  registerMode?: RegisterMode
 }
 
 export interface StoredAccount {
-  version: 4
+  version: 5
   wallets: Wallet[]
   /** The wallet the user is currently on. Null when the account has no wallets. */
   activeWalletId: string | null
@@ -111,6 +158,10 @@ export interface WalletSummary {
   id: string
   label: string
   handle: string
+  kind: WalletKind
+  didDomain: string
+  serverId: string | null
+  registered: boolean
   activeKeyIndex: number
   keyCount: number
   registeredCount: number
@@ -139,20 +190,45 @@ export type BgRequest =
   | { type: 'anp-wallet/get-state' }
   | { type: 'anp-wallet/unlock'; password: string }
   | { type: 'anp-wallet/lock' }
-  | { type: 'anp-wallet/create-account'; mnemonic: string; password: string; handle?: string; label?: string }
-  | { type: 'anp-wallet/add-wallet'; mnemonic: string; handle?: string; label?: string }
+  | {
+      type: 'anp-wallet/create-account'
+      source?: 'mnemonic'
+      mnemonic: string
+      password: string
+      handle?: string
+      label?: string
+    }
+  | {
+      type: 'anp-wallet/create-account'
+      source: 'imported'
+      privateKey: string
+      password: string
+      handle?: string
+      label?: string
+    }
+  | { type: 'anp-wallet/add-wallet'; source?: 'mnemonic'; mnemonic: string; handle?: string; label?: string }
+  | { type: 'anp-wallet/add-wallet'; source: 'imported'; privateKey: string; handle?: string; label?: string }
   | { type: 'anp-wallet/delete-wallet'; walletId: string }
   | { type: 'anp-wallet/rename-wallet'; walletId: string; label: string }
   | { type: 'anp-wallet/select-wallet'; walletId: string }
   | { type: 'anp-wallet/list-wallets' }
-  | { type: 'anp-wallet/register'; walletId: string; handle: string }
-  | { type: 'anp-wallet/add-key'; walletId: string }
+  | { type: 'anp-wallet/register'; walletId: string; handle: string; email?: string; inviteCode?: string }
+  | { type: 'anp-wallet/verify-existing'; walletId: string; handle: string }
+  | { type: 'anp-wallet/add-key'; walletId: string; privateKey?: string }
   | { type: 'anp-wallet/delete-key'; walletId: string; keyIndex: number }
   | { type: 'anp-wallet/select-active'; walletId: string; keyIndex: number }
   | { type: 'anp-wallet/set-primary'; walletId: string; keyIndex: number }
+  | { type: 'anp-wallet/rebind-server'; walletId: string; serverId: string }
   | { type: 'anp-wallet/approve'; id: string; sel?: { walletId: string; keyIndex: number } }
   | { type: 'anp-wallet/reject'; id: string }
-  | { type: 'anp-wallet/export-mnemonic' }
+  | { type: 'anp-wallet/export-secret' }
+  | { type: 'anp-wallet/list-servers' }
+  | { type: 'anp-wallet/add-server'; rpcBase: string; didDomain: string; label?: string }
+  | { type: 'anp-wallet/remove-server'; serverId: string }
+  | { type: 'anp-wallet/set-default-server'; serverId: string }
+  | { type: 'anp-wallet/test-server'; serverId: string }
+  | { type: 'anp-wallet/email-status'; serverId: string; email: string; fullHandle: string }
+  | { type: 'anp-wallet/email-send'; serverId: string; email: string; fullHandle: string }
 
 export type BgResponse =
   | SignResult

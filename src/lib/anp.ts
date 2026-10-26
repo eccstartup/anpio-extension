@@ -14,7 +14,7 @@ import { ed25519 } from '@noble/curves/ed25519'
 import { sha256 } from '@noble/hashes/sha256'
 import { sha512 } from '@noble/hashes/sha512'
 import { hmac } from '@noble/hashes/hmac'
-import { utf8ToBytes } from '@noble/hashes/utils'
+import { hexToBytes, utf8ToBytes } from '@noble/hashes/utils'
 import { base58, base64, base64urlnopad } from '@scure/base'
 
 // ---------------------------------------------------------------------------
@@ -260,7 +260,7 @@ export function jcsCanonicalize(value: unknown): string {
  * eddsa-jcs-2022 DataIntegrityProof (W3C), byte-for-byte with the official
  * `anp.proof.generate_w3c_proof`:
  *   toBeSigned = sha256(jcs(proofOptions)) || sha256(jcs(document))
- *   proofValue = base64url(Ed25519(toBeSigned))
+ *   proofValue = `z` + base58btc(Ed25519(toBeSigned))
  *
  * `domain` (the DID authority, e.g. `awiki.ai`) and `challenge` (a nonce) are
  * part of the signed proof options — awiki.ai's `register` RPC rejects proofs
@@ -291,14 +291,11 @@ export function signDidDocumentProof(
   toBeSigned.set(optionsHash, 0)
   toBeSigned.set(docHash, 32)
   const signature = ed25519.sign(toBeSigned, priv)
-  return { ...proofOptions, proofValue: base64urlnopad.encode(signature) }
+  // awiki.ai's DID verifier expects a multibase base58-btc proofValue, not base64url.
+  return { ...proofOptions, proofValue: 'z' + base58.encode(signature) }
 }
 
-/**
- * SLIP-0010 derivation path for a key at `index`. Index 0 is the wallet's
- * original path (`m/44'/0'/0'`), so existing identities stay recoverable from
- * the same mnemonic. Higher indexes derive additional independent keys.
- */
+/** Derived key index → SLIP-0010 path. */
 export function keyPathFor(index: number): DerivationPath {
   if (!Number.isInteger(index) || index < 0) throw new Error(`invalid key index: ${index}`)
   return `m/44'/0'/${index}'`
@@ -307,6 +304,125 @@ export function keyPathFor(index: number): DerivationPath {
 /** Derive the Ed25519 private key for the given key index (see keyPathFor). */
 export function deriveKeyPrivateKey(mnemonic: string, index: number): Uint8Array {
   return deriveEd25519PrivateKey(mnemonic, { path: keyPathFor(index) })
+}
+
+// ---------------------------------------------------------------------------
+// Imported Ed25519 identity keys
+// ---------------------------------------------------------------------------
+
+export type ImportedKeyFormat = 'hex' | 'base64' | 'base64url' | 'base58' | 'jwk'
+
+export interface ParsedIdentityKey {
+  seed: Uint8Array
+  publicKey: Uint8Array
+  format: ImportedKeyFormat
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i]
+  return diff === 0
+}
+
+function tryDecodeBase64(input: string): Uint8Array | null {
+  const padded = input + '='.repeat((4 - (input.length % 4)) % 4)
+  try {
+    return base64.decode(padded)
+  } catch {
+    return null
+  }
+}
+
+function tryDecodeBase64Url(input: string): Uint8Array | null {
+  try {
+    return base64urlnopad.decode(input.replace(/=+$/, ''))
+  } catch {
+    return null
+  }
+}
+
+function tryDecodeBase58(input: string): Uint8Array | null {
+  try {
+    return base58.decode(input)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Parse an imported Ed25519 private key. Accepts a 32-byte seed or a 64-byte
+ * seed||public-key in hex/base64/base64url/base58btc, plus an Ed25519 OKP JWK.
+ * Rejects anything else; the 64-byte form is checked against the derived pubkey.
+ */
+export function parseEd25519PrivateKey(input: string): ParsedIdentityKey {
+  const raw = input.trim()
+  if (!raw) throw new Error('请输入 Ed25519 身份私钥')
+
+  let bytes: Uint8Array | null = null
+  let format: ImportedKeyFormat | null = null
+
+  if (raw.startsWith('{')) {
+    let jwk: Record<string, unknown>
+    try {
+      jwk = JSON.parse(raw) as Record<string, unknown>
+    } catch {
+      throw new Error('私钥 JSON 不是合法 JWK')
+    }
+    if (!jwk || typeof jwk !== 'object') throw new Error('私钥 JSON 不是合法 JWK')
+    if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519') {
+      throw new Error('只支持 Ed25519 OKP JWK（kty=OKP, crv=Ed25519）')
+    }
+    if (typeof jwk.d !== 'string' || !jwk.d) throw new Error('JWK 缺少私钥字段 d')
+    bytes = tryDecodeBase64Url(jwk.d)
+    if (!bytes) throw new Error('JWK 的 d 字段不是合法 base64url')
+    format = 'jwk'
+  } else {
+    const hex = /^0x/i.test(raw) ? raw.slice(2) : raw
+    if (/^[0-9a-fA-F]{64}$/.test(hex) || /^[0-9a-fA-F]{128}$/.test(hex)) {
+      bytes = hexToBytes(hex)
+      format = 'hex'
+    } else if (/^z[1-9A-HJ-NP-Za-km-z]+$/.test(raw)) {
+      bytes = tryDecodeBase58(raw.slice(1))
+      format = bytes ? 'base58' : null
+    }
+
+    if (!bytes) {
+      const b64url = tryDecodeBase64Url(raw)
+      if (b64url && (b64url.length === 32 || b64url.length === 64)) {
+        bytes = b64url
+        format = 'base64url'
+      }
+    }
+    if (!bytes) {
+      const b64 = tryDecodeBase64(raw)
+      if (b64 && (b64.length === 32 || b64.length === 64)) {
+        bytes = b64
+        format = 'base64'
+      }
+    }
+    if (!bytes) {
+      const b58 = tryDecodeBase58(raw)
+      if (b58 && (b58.length === 32 || b58.length === 64)) {
+        bytes = b58
+        format = 'base58'
+      }
+    }
+  }
+
+  if (!bytes || !format) {
+    throw new Error('无法识别私钥格式：支持 32/64 字节的 hex、base64、base64url、base58 或 Ed25519 JWK')
+  }
+  if (bytes.length !== 32 && bytes.length !== 64) {
+    throw new Error(`私钥长度必须是 32 或 64 字节，当前 ${bytes.length} 字节`)
+  }
+
+  const seed = bytes.length === 64 ? bytes.slice(0, 32) : bytes.slice()
+  const publicKey = ed25519.getPublicKey(seed)
+  if (bytes.length === 64 && !bytesEqual(publicKey, bytes.slice(32))) {
+    throw new Error('64 字节私钥的后半段与前半段导出的公钥不一致')
+  }
+  return { seed, publicKey, format }
 }
 
 /**
@@ -318,6 +434,15 @@ export function deriveKeyPrivateKey(mnemonic: string, index: number): Uint8Array
  */
 export function signChallenge(priv: Uint8Array, challenge: string): string {
   return base64urlnopad.encode(ed25519.sign(utf8ToBytes(challenge), priv))
+}
+
+/** Extract the DID authority/domain from `did:wba:<domain>:...`. */
+export function didDomainOf(did: string): string | null {
+  if (!did.startsWith('did:wba:')) return null
+  const rest = did.slice('did:wba:'.length)
+  const end = rest.indexOf(':')
+  const domain = end === -1 ? rest : rest.slice(0, end)
+  return domain || null
 }
 
 /** Extract the WNS local-part from a full handle (`alice.awiki.ai` → `alice`). */
@@ -335,7 +460,7 @@ export function localPartFromHandle(handle: string, didDomain = 'awiki.ai'): str
  * with an ANPHandleService entry and a self-signed eddsa-jcs-2022 proof.
  */
 /** Optional ANPMessageService to embed in the signed DID document. */
-export interface AwikiMessageService {
+export interface AwikiMessageService extends Record<string, unknown> {
   serviceEndpoint: string
   serviceDid: string
 }
@@ -360,19 +485,11 @@ export function buildAwikiIdentity(
       serviceEndpoint: `https://${didDomain}/.well-known/handle/${localPart}`,
     },
   ]
-  // The open server requires a signed document to declare exactly one
-  // ANPMessageService pointing back at itself (awiki.ai ignored it). Append it
-  // only when the caller supplies the target server's endpoint + service DID.
+  // awiki's register adapter requires exactly one ANPMessageService. Copy the
+  // discovered descriptor verbatim (profiles/authSchemes/unknown fields) and
+  // only replace its id/type with this identity's service entry.
   if (messageService) {
-    services.push({
-      id: `${did}#anp-message`,
-      type: 'ANPMessageService',
-      serviceEndpoint: messageService.serviceEndpoint,
-      serviceDid: messageService.serviceDid,
-      profiles: [],
-      securityProfiles: ['transport-protected'],
-      authSchemes: ['bearer', 'didwba'],
-    })
+    services.push({ ...messageService, id: `${did}#message`, type: 'ANPMessageService' })
   }
 
   const doc: Record<string, unknown> = {
@@ -431,15 +548,7 @@ export function buildHandleAggregateDoc(
     },
   ]
   if (opts.messageService) {
-    services.push({
-      id: `${primaryDid}#anp-message`,
-      type: 'ANPMessageService',
-      serviceEndpoint: opts.messageService.serviceEndpoint,
-      serviceDid: opts.messageService.serviceDid,
-      profiles: [],
-      securityProfiles: ['transport-protected'],
-      authSchemes: ['bearer', 'didwba'],
-    })
+    services.push({ ...opts.messageService, id: `${primaryDid}#message`, type: 'ANPMessageService' })
   }
   const created = isoUtcNow()
   const doc: Record<string, unknown> = {
