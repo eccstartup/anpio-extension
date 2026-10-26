@@ -81,13 +81,60 @@ const LEGACY_AGGREGATE_SERVER: ServerConfig = {
 
 interface Pending {
   id: string
+  pageId: string
   req: SignReq
   tabId: number
+  documentId: string
+  frameId: number
   pageOrigin: string
+  expiresAt: number
 }
 
 // Map keeps insertion order; newest last.
 const pending = new Map<string, Pending>()
+const MAX_PENDING = 32
+const MAX_SIGN_REQUEST_BYTES = 1024 * 1024
+const PENDING_TTL_MS = 5 * 60 * 1000
+
+function prunePending() {
+  for (const [id, item] of pending) {
+    if (Date.now() >= item.expiresAt) pending.delete(id)
+  }
+}
+
+function clearTabPending(tabId: number) {
+  for (const [id, item] of pending) {
+    if (item.tabId === tabId) pending.delete(id)
+  }
+  refreshBadge()
+}
+
+chrome.tabs.onRemoved?.addListener(clearTabPending)
+chrome.tabs.onUpdated?.addListener((tabId, change) => {
+  if (change.status === 'loading') clearTabPending(tabId)
+})
+
+function snapshotSignRequest(req: SignReq): SignReq {
+  if (!req || typeof req.url !== 'string' || typeof req.body !== 'string' ||
+      typeof req.nonce !== 'string' || !req.nonce.trim() ||
+      (req.method !== undefined && typeof req.method !== 'string') ||
+      (req.headers !== undefined && (req.headers === null || typeof req.headers !== 'object' ||
+        Array.isArray(req.headers) || Object.values(req.headers).some((value) => typeof value !== 'string')))) {
+    throw new Error('Invalid signing request or missing nonce')
+  }
+  const url = new URL(req.url)
+  if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error('Invalid signing URL')
+  }
+  const copy: SignReq = { url: req.url, body: req.body, nonce: req.nonce,
+    ...(req.method !== undefined ? { method: req.method } : {}),
+    ...(req.headers !== undefined ? { headers: { ...req.headers } } : {}) }
+  if (new TextEncoder().encode(JSON.stringify(copy)).length > MAX_SIGN_REQUEST_BYTES) {
+    throw new Error('Signing request too large')
+  }
+  if (copy.headers) Object.freeze(copy.headers)
+  return Object.freeze(copy)
+}
 
 // ---------------------------------------------------------------------------
 // WebCrypto AES-GCM + PBKDF2
@@ -1042,14 +1089,20 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, sender, sendResponse) => {
 })
 
 async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Promise<BgResponse> {
+  // Content scripts may request a signature, but only the wallet UI may approve
+  // one or operate the vault. Do not trust the message's claimed type alone.
+  if (msg.type !== 'anp-wallet/sign' && msg.type !== 'anp-wallet/get-identity' &&
+      (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('popup.html'))) {
+    return { status: 'error', error: 'Wallet UI required' }
+  }
+  prunePending()
   switch (msg.type) {
     case 'anp-wallet/sign': {
-      const { id, req } = msg.payload
-      // ANP-03 requires a server-issued nonce; without one there is nothing
-      // legitimate to sign, and the wallet must not invent a substitute.
-      if (typeof req.nonce !== 'string' || !req.nonce.trim()) {
-        return { status: 'error', error: 'Missing nonce: refusing to sign without one.' }
+      const { id: pageId } = msg.payload
+      if (typeof pageId !== 'string' || !pageId || pageId.length > 256) {
+        return { status: 'error', error: 'Invalid request ID' }
       }
+      const req = snapshotSignRequest(msg.payload.req)
       const account = await loadAccount()
       if (!account) {
         void openPopup()
@@ -1057,15 +1110,26 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
       }
 
       const tabId = sender.tab?.id
-      if (tabId == null) return { status: 'error', error: 'No tab context' }
-
-      // Stage even while locked: the popup opens, the user unlocks, then approves.
-      pending.set(id, {
+      const documentId = sender.documentId
+      if (tabId == null || !documentId) return { status: 'error', error: 'No document context' }
+      // Check after the asynchronous load too: concurrent messages must not
+      // exceed the cap or create two records for the same page request.
+      prunePending()
+      if ([...pending.values()].some((p) => p.tabId === tabId && p.documentId === documentId && p.pageId === pageId)) {
+        return { status: 'error', error: 'Duplicate pending request' }
+      }
+      if (pending.size >= MAX_PENDING) return { status: 'error', error: 'Too many pending requests' }
+      const id = crypto.randomUUID()
+      pending.set(id, Object.freeze({
         id,
+        pageId,
         req,
         tabId,
+        documentId,
+        frameId: sender.frameId ?? 0,
         pageOrigin: (sender.origin ?? '') || (sender.url ? new URL(sender.url).origin : ''),
-      })
+        expiresAt: Date.now() + PENDING_TTL_MS,
+      }))
       refreshBadge()
       void openPopup()
       return { status: 'pending', id }
@@ -1845,6 +1909,7 @@ async function approve(
   allowed: boolean,
   sel?: { walletId: string; keyIndex: number },
 ): Promise<BgResponse> {
+  prunePending()
   const item = pending.get(id)
   if (!item) return { status: 'error', error: 'Unknown request' }
   if (!unlocked) return { status: 'locked', error: 'Wallet locked. Unlock first.' }
@@ -1855,12 +1920,12 @@ async function approve(
   const deliver = (result: SignResult | null, error?: string, status?: SignResultMessage['status']) => {
     const message: SignResultMessage = {
       wrap: PAGE_MESSAGE,
-      id,
+      id: item.pageId,
       status: status ?? (allowed ? 'ok' : 'rejected'),
       result: result ?? undefined,
       error,
     }
-    void chrome.tabs.sendMessage(item.tabId, message).catch(() => {})
+    void chrome.tabs.sendMessage(item.tabId, message, { documentId: item.documentId, frameId: item.frameId }).catch(() => {})
   }
 
   if (!allowed) {

@@ -27,17 +27,22 @@ const sessionStore = new Map<string, unknown>()
 let uiAcksPings = false
 const tabMessages: { id: string; status: string; result?: Record<string, unknown>; error?: string }[] = []
 let openPopupCalls = 0
+let tabUpdated: (tabId: number, change: { status?: string }) => void = () => {}
+let tabRemoved: (tabId: number) => void = () => {}
+const deliveries: {tabId: number; options: {documentId: string; frameId: number}}[] = []
 
 ;(globalThis as unknown as { chrome: unknown }).chrome = {
   runtime: {
+    id: 'audit-test-extension',
+    getURL: (path: string) => `chrome-extension://audit-test-extension/${path}`,
     onMessage: { addListener: (h: typeof bgHandler) => (bgHandler = h) },
     onInstalled: { addListener: () => {} },
     sendMessage: (msg: { type?: string }) =>
       new Promise((resolve) => {
         const sender =
           msg?.type === 'anp-wallet/sign'
-            ? { tab: { id: 7 }, origin: 'http://localhost:3000', url: 'http://localhost:3000/' }
-            : {}
+            ? { tab: { id: 7 }, documentId: 'page-document-7', frameId: 0, origin: 'http://localhost:3000', url: 'http://localhost:3000/' }
+            : { id: 'audit-test-extension', url: 'chrome-extension://audit-test-extension/popup.html' }
         bgHandler(msg, sender, (resp: unknown) => resolve(structuredClone(resp)))
       }),
   },
@@ -77,7 +82,10 @@ let openPopupCalls = 0
   },
   windows: { create: async () => ({ id: 99 }) },
   tabs: {
-    sendMessage: async (_tabId: number, m: (typeof tabMessages)[number]) => {
+    onUpdated: { addListener: (fn: typeof tabUpdated) => { tabUpdated = fn } },
+    onRemoved: { addListener: (fn: typeof tabRemoved) => { tabRemoved = fn } },
+    sendMessage: async (tabId: number, m: (typeof tabMessages)[number], options: {documentId: string; frameId: number}) => {
+      deliveries.push({tabId, options})
       tabMessages.push(m)
       return true
     },
@@ -1116,6 +1124,7 @@ async function main() {
   eq(signAck.status, 'pending', 'sign stages while locked')
   st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
   const staged = must(st.pending[0], 'staged pending request') as {
+    id: string
     url: string
     method: string
     nonce: string
@@ -1128,7 +1137,7 @@ async function main() {
 
   const unlockA = await bg<Resp>({ type: 'anp-wallet/unlock', password })
   eq(unlockA.status, 'ok', 'unlock mnemonic wallet')
-  const approveA = await bg<Resp<{ did: string; body: string }>>({ type: 'anp-wallet/approve', id: 'req-1' })
+  const approveA = await bg<Resp<{ did: string; body: string }>>({ type: 'anp-wallet/approve', id: signAck.id })
   eq(approveA.status, 'ok', 'approve mnemonic signature')
   const deliveredA = must(tabMessages.find((m) => m.id === 'req-1'), 'delivered mnemonic signature')
   eq((deliveredA.result as { did: string }).did, regA.did, 'mnemonic signature uses registered DID')
@@ -1150,16 +1159,16 @@ async function main() {
   eq(signPanel.status, 'pending', 'sign stages with the side panel open')
   await new Promise((resolve) => setTimeout(resolve, 500))
   eq(openPopupCalls, popupCallsBefore, 'open side panel suppresses the separate approval window')
-  await bg({ type: 'anp-wallet/reject', id: 'req-panel' })
+  await bg({ type: 'anp-wallet/reject', id: signPanel.id })
   uiAcksPings = false
 
   // A request without a site body is signed as empty bytes, not filled in by
   // the wallet with fields the site never asked for.
-  await bg<Resp<{ id: string }>>({
+  const emptyAck = await bg<Resp<{ id: string }>>({
     type: 'anp-wallet/sign',
     payload: { id: 'req-empty', req: { url: TARGET, method: 'POST', body: '', nonce } },
   })
-  const approveEmpty = await bg<Resp<{ body: string }>>({ type: 'anp-wallet/approve', id: 'req-empty' })
+  const approveEmpty = await bg<Resp<{ body: string }>>({ type: 'anp-wallet/approve', id: emptyAck.id })
   eq(approveEmpty.status, 'ok', 'approve a signature without a site body')
   const deliveredEmpty = must(
     tabMessages.find((m) => m.id === 'req-empty'),
@@ -1191,7 +1200,7 @@ async function main() {
   eq(signSel.status, 'pending', 'sign stages for self-select')
   const approveSel = await bg<Resp>({
     type: 'anp-wallet/approve',
-    id: 'req-sel',
+    id: signSel.id,
     sel: { walletId: walletBId, keyIndex: 0 },
   })
   eq(approveSel.status, 'ok', 'approve imported key self-select')
@@ -1434,6 +1443,50 @@ async function main() {
   console.log('auto-lock setting: ok')
 
   // =========================================================================
+  // Security regressions: approval binds an immutable wallet-generated record.
+  const pageSender = {tab: {id: 71}, documentId: 'document-a', frameId: 0,
+    origin: 'https://page.example', url: 'https://page.example/'}
+  const fromPage = (msg: unknown, sender = pageSender): Promise<any> =>
+    new Promise((resolve) => bgHandler(msg, sender, (resp) => resolve(structuredClone(resp))))
+  const safeBody = JSON.stringify({nonce, action: 'safe-login'})
+  const first = await fromPage({type: 'anp-wallet/sign', payload: {id: 'same-page-id', req: {url: TARGET, body: safeBody, nonce}}})
+  eq(first.status, 'pending', 'stage immutable request')
+  assert(first.id !== 'same-page-id', 'approval ID is generated by wallet')
+  const snapshot = await bg<StateLike>({type: 'anp-wallet/get-state'})
+  const shown = snapshot.pending.find((p: any) => p.id === first.id) as any
+  eq(shown.body, safeBody, 'UI sees original body')
+  const duplicate = await fromPage({type: 'anp-wallet/sign', payload: {id: 'same-page-id', req: {url: TARGET, body: 'replacement-not-shown', nonce}}})
+  eq(duplicate.status, 'error', 'same-document duplicate cannot replace snapshot')
+  const second = await fromPage({type: 'anp-wallet/sign', payload: {id: 'same-page-id', req: {url: TARGET, body: 'other-tab', nonce}}},
+    {...pageSender, tab: {id: 72}, documentId: 'document-b'})
+  eq(second.status, 'pending', 'another tab has a separate request namespace')
+  assert(second.id !== first.id, 'cross-tab IDs do not collide')
+  eq((await fromPage({type: 'anp-wallet/approve', id: first.id})).status, 'error', 'content script cannot approve')
+  const approved = await bg<Resp>({type: 'anp-wallet/approve', id: shown.id})
+  eq(approved.status, 'ok', 'old snapshot still approves original immutable record')
+  const signed = tabMessages.filter((m) => m.id === 'same-page-id').slice(-1)[0]!
+  assert(String(signed.result?.body).includes('safe-login'), 'only the displayed request was signed')
+  assert(!String(signed.result?.body).includes('replacement-not-shown'), 'replacement was not signed')
+  eq(deliveries[deliveries.length - 1]?.options.documentId, 'document-a', 'result targets original document')
+  eq(deliveries[deliveries.length - 1]?.tabId, 71, 'result targets original tab')
+  eq((await bg<Resp>({type: 'anp-wallet/approve', id: first.id})).status, 'error', 'approval cannot replay')
+  tabUpdated(72, {status: 'loading'})
+  eq((await bg<Resp>({type: 'anp-wallet/approve', id: second.id})).status, 'error', 'navigation invalidates approval')
+  const pendingMessage = (id: string, body = '') => ({type: 'anp-wallet/sign', payload: {id, req: {url: TARGET, body, nonce}}})
+  eq((await fromPage(pendingMessage('oversize', 'x'.repeat(1024 * 1024)))).status, 'error', 'oversize requests refused')
+  const expiring = await fromPage(pendingMessage('expires'))
+  const savedNow = Date.now
+  try {
+    Date.now = () => savedNow() + 5 * 60 * 1000 + 1
+    eq((await bg<Resp>({type: 'anp-wallet/approve', id: expiring.id})).status, 'error', 'expired request cannot be approved')
+  } finally { Date.now = savedNow }
+  const concurrent = await Promise.all(Array.from({length: 40}, (_, i) => fromPage(pendingMessage(`queue-${i}`))))
+  eq(concurrent.filter((r) => r.status === 'pending').length, 32, 'concurrent requests respect queue cap')
+  tabRemoved(71)
+  const afterClose = await bg<StateLike>({type: 'anp-wallet/get-state'})
+  assert(!afterClose.pending.some((p: any) => concurrent.some((r) => r.id === p.id)), 'closing tab clears its requests')
+  console.log('immutable approval, sender isolation, document binding, expiry and queue limits: ok')
+
   // 13. Global invariants: headers, identity-only, deletable last wallet.
   // =========================================================================
   const discoveryCalls = calls.filter((c) => c.path === '/.well-known/did.json')

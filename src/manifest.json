@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "minimum_chrome_version": "110",
   "name": "ANP Wallet",
   "version": "0.1.0",
   "description": "ANP Agent Network Protocol did:wba wallet — ANP-03 HTTP Message Signatures (RFC 9421).",
