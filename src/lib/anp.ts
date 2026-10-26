@@ -294,7 +294,13 @@ export function signDidDocumentProof(
   const withoutProof: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(doc)) if (k !== 'proof') withoutProof[k] = v
 
-  const optionsHash = sha256(utf8ToBytes(jcsCanonicalize(proofOptions)))
+  // The ANP SDK's eddsa-jcs-2022 verifier folds the document's @context into
+  // the proof configuration for multibase (z…) proofValue; sign the same bytes.
+  // The proof object itself still carries only the standard proof fields.
+  const proofConfig = { ...proofOptions }
+  if (withoutProof['@context'] !== undefined) proofConfig['@context'] = withoutProof['@context']
+
+  const optionsHash = sha256(utf8ToBytes(jcsCanonicalize(proofConfig)))
   const docHash = sha256(utf8ToBytes(jcsCanonicalize(withoutProof)))
   const toBeSigned = new Uint8Array(64)
   toBeSigned.set(optionsHash, 0)
@@ -486,11 +492,16 @@ export interface AwikiMessageService extends Record<string, unknown> {
  * no device or communication private key is stored or usable.
  */
 const DEVICE_MANIFEST_ID = 'device-1'
+// Canonical vNext write bundle used by the official WBA identity generator.
+// Declaring the E2EE profiles is required by the device manifest contract even
+// though this wallet never holds the E2EE private half or performs E2EE.
 const DEVICE_PROFILES = [
   'anp.core.binding.v1',
   'anp.identity.discovery.v1',
   'anp.direct.base.v1',
+  'anp.direct.e2ee.v2',
   'anp.group.base.v2',
+  'anp.group.e2ee.v2',
 ]
 
 function buildDeviceDeclaration(did: string): {

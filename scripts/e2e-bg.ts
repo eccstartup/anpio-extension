@@ -439,12 +439,17 @@ function assertDeviceManifest(doc: Record<string, unknown>): void {
   assert(typeof device.device_id === 'string' && device.device_id.length > 0, 'device_id non-empty')
   const profiles = device.profiles as string[]
   assert(Array.isArray(profiles) && profiles.length > 0, 'device profiles non-empty')
-  for (const required of ['anp.core.binding.v1', 'anp.identity.discovery.v1']) {
-    assert(profiles.includes(required), `device declares ${required}`)
-  }
-  assert(
-    !profiles.some((p) => p.includes('.e2ee.')),
-    'identity-only device does not claim E2EE profiles',
+  eqJson(
+    profiles,
+    [
+      'anp.core.binding.v1',
+      'anp.identity.discovery.v1',
+      'anp.direct.base.v1',
+      'anp.direct.e2ee.v2',
+      'anp.group.base.v2',
+      'anp.group.e2ee.v2',
+    ],
+    'device declares the canonical vNext WBA profile bundle',
   )
 
   const did = String(doc.id)
@@ -495,9 +500,13 @@ function assertDocumentProof(doc: Record<string, unknown>): void {
   const publicKey = decodeMultibase(vm.publicKeyMultibase, 'proof key')
   eq(publicKey[0], 0xed, 'proof key is Ed25519')
 
-  const { proofValue: _proofValue, ...options } = proof
+  const { proofValue: _proofValue, ...proofFields } = proof
   const unsigned: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(doc)) if (key !== 'proof') unsigned[key] = value
+  // ANP's eddsa-jcs-2022 verifier folds @context into the proof configuration
+  // for multibase proofValue; reproduce that when checking the signature.
+  const options: Record<string, unknown> = { ...proofFields }
+  if (unsigned['@context'] !== undefined) options['@context'] = unsigned['@context']
   const input = new Uint8Array(64)
   input.set(sha256(utf8ToBytes(jcsCanonicalize(options))), 0)
   input.set(sha256(utf8ToBytes(jcsCanonicalize(unsigned))), 32)

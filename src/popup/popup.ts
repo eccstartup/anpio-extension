@@ -319,7 +319,7 @@ function updateSecretView(): void {
   const creating = secretMode === 'create'
   $('secret-title').textContent = creating ? '创建钱包' : '添加钱包'
   $('secret-intro').textContent = creating
-    ? '钱包只管理 Ed25519 身份密钥和 DID；不会生成或保存任何通信/E2EE 密钥。'
+    ? '钱包只管理 Ed25519 身份密钥和 DID；不会保存或使用任何通信/E2EE 私钥。'
     : '新钱包会使用当前已解锁的全局密码加密；所有钱包共享同一个密码。'
   hide($('password-field'), !creating)
   hide($('btn-secret-cancel'), creating)
