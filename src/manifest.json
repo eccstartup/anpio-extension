@@ -4,8 +4,10 @@
   "version": "0.1.0",
   "description": "ANP Agent Network Protocol did:wba wallet — ANP-03 HTTP Message Signatures (RFC 9421).",
   "action": {
-    "default_popup": "popup.html",
     "default_title": "ANP Wallet"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
   },
   "background": {
     "service_worker": "background.js"
@@ -24,7 +26,7 @@
       "world": "ISOLATED"
     }
   ],
-  "permissions": ["storage", "clipboardWrite"],
+  "permissions": ["storage", "clipboardWrite", "sidePanel"],
   "host_permissions": ["https://awiki.ai/*"],
   "optional_host_permissions": ["https://*/*"],
   "icons": {

@@ -13,10 +13,14 @@
 
 * { box-sizing: border-box; }
 
+html {
+  background: var(--bg);
+}
+
 body {
   margin: 0;
-  width: 360px;
-  max-height: 560px;
+  width: 100%;
+  min-height: 100vh;
   overflow-y: auto;
   background: var(--bg);
   color: var(--text);

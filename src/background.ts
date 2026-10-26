@@ -858,18 +858,58 @@ function buildPendingState(p: Pending, did: string | null): PendingRequest {
   }
 }
 
-// Surf the approval UI the moment a site asks for a signature.
-async function openPopup() {
+// The side panel stays open while the user visits other tabs (e.g. an email
+// activation link), so an open UI re-renders in place instead of losing state.
+function nudgeUi(): number {
+  const ping = Date.now()
   try {
-    await chrome.action.openPopup()
+    void chrome.storage.session?.set({ anp_ui_ping: ping })?.catch(() => {})
   } catch {
-    try {
-      await chrome.windows.create({ url: chrome.runtime.getURL('popup.html'), type: 'popup', width: 440, height: 640 })
-    } catch {
-      /* ignore */
-    }
+    /* storage.session unavailable on very old Chrome */
+  }
+  return ping
+}
+
+async function uiAnswered(ping: number): Promise<boolean> {
+  try {
+    const got = (await chrome.storage.session?.get('anp_ui_ack')) as { anp_ui_ack?: number } | undefined
+    return got?.anp_ui_ack === ping
+  } catch {
+    return false
   }
 }
+
+// Surf the approval UI the moment a site asks for a signature.
+async function openPopup() {
+  const ping = nudgeUi()
+  // Give an open side panel a moment to render and acknowledge before opening
+  // a separate window on top of it.
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  if (await uiAnswered(ping)) return
+  try {
+    await chrome.action.openPopup()
+    return
+  } catch {
+    /* no action popup: the extension lives in the side panel */
+  }
+  try {
+    const win = await chrome.windows.getLastFocused()
+    if (win.id != null) {
+      await chrome.sidePanel.open({ windowId: win.id })
+      return
+    }
+  } catch {
+    /* sidePanel.open needs a user gesture; fall through to a window */
+  }
+  try {
+    await chrome.windows.create({ url: chrome.runtime.getURL('popup.html'), type: 'popup', width: 440, height: 640 })
+  } catch {
+    /* ignore */
+  }
+}
+
+// Toolbar click opens the wallet in the browser side panel.
+chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true })?.catch(() => {})
 
 // ---------------------------------------------------------------------------
 // Server validation

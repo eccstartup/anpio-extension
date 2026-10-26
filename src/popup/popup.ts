@@ -1777,3 +1777,12 @@ function wireEvents(): void {
 
 wireEvents()
 void render()
+
+// The side panel remains open across tab navigation. Redraw when the background
+// surfaces a new signing request, and acknowledge so it does not also open a
+// separate approval window on top of the panel.
+chrome.storage.session?.onChanged?.addListener((changes) => {
+  const ping = changes.anp_ui_ping?.newValue
+  if (typeof ping !== 'number') return
+  void render().then(() => chrome.storage.session?.set({ anp_ui_ack: ping })?.catch(() => {}))
+})

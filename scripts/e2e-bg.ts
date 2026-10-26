@@ -22,6 +22,9 @@ import { AWIKI_CLIENT_VERSION } from '../src/lib/awiki'
 // ---- mock chrome -----------------------------------------------------------
 let bgHandler: (msg: unknown, sender: unknown, sendResponse: (r: unknown) => void) => void = () => {}
 const store = new Map<string, unknown>()
+const sessionStore = new Map<string, unknown>()
+// Simulates an open side panel that re-renders and acknowledges background pings.
+let uiAcksPings = false
 const tabMessages: { id: string; status: string; result?: Record<string, unknown>; error?: string }[] = []
 let openPopupCalls = 0
 
@@ -48,6 +51,16 @@ let openPopupCalls = 0
       },
       set: async (obj: Record<string, unknown>) => {
         for (const k of Object.keys(obj)) store.set(k, obj[k])
+      },
+    },
+    session: {
+      get: async (key: string) => (sessionStore.has(key) ? { [key]: sessionStore.get(key) } : {}),
+      set: async (obj: Record<string, unknown>) => {
+        for (const k of Object.keys(obj)) sessionStore.set(k, obj[k])
+        // An open side panel re-renders on the ping and writes the ack value.
+        if (uiAcksPings && typeof obj.anp_ui_ping === 'number') {
+          sessionStore.set('anp_ui_ack', obj.anp_ui_ping)
+        }
       },
     },
   },
@@ -370,6 +383,15 @@ const assertThrows = (fn: () => unknown, substr: string, msg: string) => {
   throw new Error('ASSERT FAILED: ' + msg + ' (no error thrown)')
 }
 
+async function waitFor(cond: () => boolean, msg: string, timeoutMs = 3000): Promise<void> {
+  const until = Date.now() + timeoutMs
+  while (Date.now() < until) {
+    if (cond()) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error('ASSERT FAILED: ' + msg)
+}
+
 /**
  * Every stored DID document must be a valid one-device manifest document with
  * a proof over the whole document, and must contain only public key material.
@@ -533,6 +555,20 @@ function assertVersionHeader(call: Call, label: string): void {
 }
 
 async function main() {
+  // =========================================================================
+  // 0. Packaging: the UI ships as the side panel, not a transient popup.
+  // =========================================================================
+  const builtManifest = JSON.parse(
+    readFileSync(new URL('../dist/manifest.json', import.meta.url), 'utf8'),
+  ) as {
+    side_panel?: { default_path?: string }
+    action?: { default_popup?: string }
+    permissions?: string[]
+  }
+  eq(builtManifest.side_panel?.default_path, 'popup.html', 'built manifest declares the side panel UI')
+  assert(!builtManifest.action?.default_popup, 'action click opens the side panel, not a popup')
+  assert((builtManifest.permissions ?? []).includes('sidePanel'), 'sidePanel permission declared')
+
   // =========================================================================
   // 1. v4 → v5 migration: server binding, kind, aggregate inference, token drop.
   // =========================================================================
@@ -1064,7 +1100,7 @@ async function main() {
     payload: { id: 'req-1', req: { url: TARGET, method: 'POST', body, nonce } },
   })
   eq(signAck.status, 'pending', 'sign stages while locked')
-  assert(openPopupCalls > 0, 'sign opens popup')
+  await waitFor(() => openPopupCalls > 0, 'sign opens the approval UI when nothing is open')
 
   const unlockA = await bg<Resp>({ type: 'anp-wallet/unlock', password })
   eq(unlockA.status, 'ok', 'unlock mnemonic wallet')
@@ -1074,6 +1110,19 @@ async function main() {
   eq((deliveredA.result as { did: string }).did, regA.did, 'mnemonic signature uses registered DID')
   const bodyA = JSON.parse((deliveredA.result as { body: string }).body)
   eq(bodyA.didDocument.id, regA.did, 'delivered body carries the signing DID document')
+
+  // An open side panel acknowledges the ping, so no extra window is opened.
+  const popupCallsBefore = openPopupCalls
+  uiAcksPings = true
+  const signPanel = await bg<Resp<{ id: string }>>({
+    type: 'anp-wallet/sign',
+    payload: { id: 'req-panel', req: { url: TARGET, method: 'POST', body, nonce } },
+  })
+  eq(signPanel.status, 'pending', 'sign stages with the side panel open')
+  await new Promise((resolve) => setTimeout(resolve, 500))
+  eq(openPopupCalls, popupCallsBefore, 'open side panel suppresses the separate approval window')
+  await bg({ type: 'anp-wallet/reject', id: 'req-panel' })
+  uiAcksPings = false
 
   const signSel = await bg<Resp<{ id: string }>>({
     type: 'anp-wallet/sign',
