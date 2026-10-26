@@ -155,6 +155,16 @@ export interface ActiveKeyRef {
   keyIndex: number
 }
 
+/**
+ * Idle minutes before the vault locks itself. `0` locks as soon as the wallet
+ * UI closes instead of running a countdown.
+ */
+export type AutoLockMinutes = 0 | 1 | 3 | 5 | 20
+
+export interface WalletSettings {
+  autoLockMinutes: AutoLockMinutes
+}
+
 /** Lightweight view of a wallet for the switcher / list (no secrets). */
 export interface WalletSummary {
   id: string
@@ -192,6 +202,7 @@ export type BgRequest =
   | { type: 'anp-wallet/get-state' }
   | { type: 'anp-wallet/unlock'; password: string }
   | { type: 'anp-wallet/lock' }
+  | { type: 'anp-wallet/set-auto-lock'; minutes: number }
   | {
       type: 'anp-wallet/create-account'
       source?: 'mnemonic'

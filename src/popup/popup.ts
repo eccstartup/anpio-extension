@@ -34,6 +34,7 @@ interface State {
   pending: PendingRequest[]
   servers: ServerConfig[]
   defaultServerId: string
+  autoLockMinutes: number
 }
 
 interface RegDraft {
@@ -610,6 +611,8 @@ function renderWalletList(state: State): void {
   const exportBtn = $('btn-export') as HTMLButtonElement
   exportBtn.textContent = wallet?.kind === 'imported' ? '导出私钥' : '导出助记词'
   exportBtn.disabled = !wallet
+  const autoLock = $('auto-lock-select') as HTMLSelectElement
+  if (document.activeElement !== autoLock) autoLock.value = String(state.autoLockMinutes ?? 5)
   hide($('unlocked-row'), false)
 }
 
@@ -1542,6 +1545,24 @@ function renderSignList(state: State): void {
 // Wire events
 // ---------------------------------------------------------------------------
 
+async function setAutoLock(): Promise<void> {
+  const select = $('auto-lock-select') as HTMLSelectElement
+  const minutes = Number(select.value)
+  const hint = $('auto-lock-hint')
+  hint.textContent = ''
+  try {
+    const resp = await send({ type: 'anp-wallet/set-auto-lock', minutes })
+    if (resp.status !== 'ok') {
+      hint.textContent = typeof resp.error === 'string' ? resp.error : '保存失败'
+      return
+    }
+    hint.textContent =
+      minutes === 0 ? '已设置：关闭钱包面板后立即锁定' : `已设置：闲置 ${minutes} 分钟后锁定`
+  } catch (e) {
+    hint.textContent = e instanceof Error ? e.message : String(e)
+  }
+}
+
 function wireEvents(): void {
   for (const tab of document.querySelectorAll<HTMLButtonElement>('#source-tabs .tab')) {
     tab.addEventListener('click', () => {
@@ -1658,6 +1679,7 @@ function wireEvents(): void {
     await render()
   })
   $('btn-export').addEventListener('click', () => void exportSecret())
+  $('auto-lock-select').addEventListener('change', () => void setAutoLock())
   $('btn-copy-export').addEventListener('click', () => {
     const text = $('export-box').textContent || ''
     if (!text) return
@@ -1816,6 +1838,22 @@ function wireEvents(): void {
 
 wireEvents()
 void render()
+
+// A long-lived port tells the background when the wallet UI closes (the
+// "lock immediately" setting relies on it). Reconnect after a service-worker
+// restart so closing the panel still locks, and re-render to show real state.
+function connectUiPort(): void {
+  try {
+    const uiPort = chrome.runtime.connect({ name: 'anp-wallet-ui' })
+    uiPort.onDisconnect.addListener(() => {
+      void render()
+      window.setTimeout(connectUiPort, 500)
+    })
+  } catch {
+    window.setTimeout(connectUiPort, 2000)
+  }
+}
+connectUiPort()
 
 // The side panel remains open across tab navigation. Redraw when the background
 // surfaces a new signing request, and acknowledge so it does not also open a

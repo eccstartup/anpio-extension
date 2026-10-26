@@ -356,6 +356,7 @@ interface StateLike {
   pending: unknown[]
   servers: ServerLike[]
   defaultServerId: string
+  autoLockMinutes: number
 }
 
 const assert = (cond: unknown, msg: string) => {
@@ -1365,7 +1366,25 @@ async function main() {
   console.log('legacy aggregate: ok')
 
   // =========================================================================
-  // 12. Global invariants: headers, identity-only, deletable last wallet.
+  // 12. Auto-lock setting: persisted, validated, surfaced in state.
+  // =========================================================================
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  eq(st.autoLockMinutes, 5, 'default auto-lock is five minutes')
+
+  const badLock = await bg<Resp>({ type: 'anp-wallet/set-auto-lock', minutes: 2 })
+  eq(badLock.status, 'error', 'unsupported auto-lock interval rejected')
+
+  for (const minutes of [1, 3, 20, 0]) {
+    const setLock = await bg<Resp>({ type: 'anp-wallet/set-auto-lock', minutes })
+    eq(setLock.status, 'ok', `set auto-lock to ${minutes}`)
+    st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+    eq(st.autoLockMinutes, minutes, `auto-lock ${minutes} surfaced in state`)
+    eq((store.get('anp_settings') as { autoLockMinutes: number }).autoLockMinutes, minutes, `auto-lock ${minutes} persisted`)
+  }
+  console.log('auto-lock setting: ok')
+
+  // =========================================================================
+  // 13. Global invariants: headers, identity-only, deletable last wallet.
   // =========================================================================
   const discoveryCalls = calls.filter((c) => c.path === '/.well-known/did.json')
   assert(discoveryCalls.length >= 4, 'discovery was exercised')
@@ -1389,7 +1408,7 @@ async function main() {
   eq(st.unlocked, false, 'vault locks when the last wallet is deleted')
 
   console.log(
-    'RESULT: PASS ✅ (v4→v5 migration, server registry, mnemonic+imported wallets, import parsing, verify-existing, email+did_document register, custom server rebind, domain guards, aggregate compat, signing, identity-only)',
+    'RESULT: PASS ✅ (v4→v5 migration, server registry, mnemonic+imported wallets, import parsing, verify-existing, email+did_document register, custom server rebind, domain guards, aggregate compat, auto-lock setting, signing, identity-only)',
   )
 }
 

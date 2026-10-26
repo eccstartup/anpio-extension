@@ -35,6 +35,7 @@ import {
 import {
   PAGE_MESSAGE,
   type ActiveKeyRef,
+  type AutoLockMinutes,
   type BgRequest,
   type BgResponse,
   type PendingRequest,
@@ -48,6 +49,7 @@ import {
   type StoredKey,
   type Wallet,
   type WalletKind,
+  type WalletSettings,
 } from './protocol'
 
 // ---------------------------------------------------------------------------
@@ -187,6 +189,35 @@ function parseWalletSecret(wallet: Wallet, plaintext: string): WalletSecret {
 // ---------------------------------------------------------------------------
 const ACCOUNT_KEY = 'anp_account'
 const SERVERS_KEY = 'anp_servers'
+const SETTINGS_KEY = 'anp_settings'
+
+const AUTO_LOCK_CHOICES: readonly AutoLockMinutes[] = [0, 1, 3, 5, 20]
+const DEFAULT_AUTO_LOCK: AutoLockMinutes = 5
+
+let cachedSettings: WalletSettings | null = null
+
+function isAutoLockMinutes(value: unknown): value is AutoLockMinutes {
+  return typeof value === 'number' && (AUTO_LOCK_CHOICES as readonly number[]).includes(value)
+}
+
+async function loadSettings(): Promise<WalletSettings> {
+  if (cachedSettings) return cachedSettings
+  let minutes: AutoLockMinutes = DEFAULT_AUTO_LOCK
+  try {
+    const record = await chrome.storage.local.get(SETTINGS_KEY)
+    const raw = record[SETTINGS_KEY] as Partial<WalletSettings> | undefined
+    if (raw && isAutoLockMinutes(raw.autoLockMinutes)) minutes = raw.autoLockMinutes
+  } catch {
+    /* fall back to the default */
+  }
+  cachedSettings = { autoLockMinutes: minutes }
+  return cachedSettings
+}
+
+async function saveSettings(settings: WalletSettings): Promise<void> {
+  cachedSettings = settings
+  await chrome.storage.local.set({ [SETTINGS_KEY]: settings })
+}
 
 type LegacyKey = StoredKey & { accessToken?: string }
 
@@ -887,6 +918,52 @@ async function uiAnswered(ping: number): Promise<boolean> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-lock. Numeric settings count idle minutes since the last wallet action;
+// `0` means lock as soon as the wallet UI (side panel / popup window) closes.
+// The unlock state is memory-only, so a recycled service worker locks anyway.
+// ---------------------------------------------------------------------------
+const UI_PORT = 'anp-wallet-ui'
+let autoLockTimer: ReturnType<typeof setTimeout> | null = null
+let uiPorts = 0
+
+function clearAutoLock(): void {
+  if (autoLockTimer !== null) {
+    clearTimeout(autoLockTimer)
+    autoLockTimer = null
+  }
+}
+
+function lockNow(): void {
+  if (!unlocked) return
+  clearAutoLock()
+  unlocked = null
+  nudgeUi()
+}
+
+async function armAutoLock(): Promise<void> {
+  clearAutoLock()
+  if (!unlocked) return
+  const { autoLockMinutes } = await loadSettings()
+  if (autoLockMinutes === 0) return
+  const timer = setTimeout(lockNow, autoLockMinutes * 60_000)
+  // Node (integration tests) would otherwise stay alive for the timeout.
+  ;(timer as unknown as { unref?: () => void }).unref?.()
+  autoLockTimer = timer
+}
+
+function watchUiPort(port: chrome.runtime.Port): void {
+  if (port.name !== UI_PORT) return
+  uiPorts += 1
+  port.onDisconnect.addListener(() => {
+    uiPorts = Math.max(0, uiPorts - 1)
+    if (uiPorts > 0) return
+    void loadSettings().then((settings) => {
+      if (settings.autoLockMinutes === 0) lockNow()
+    })
+  })
+}
+
 // Surf the approval UI the moment a site asks for a signature.
 async function openPopup() {
   const ping = nudgeUi()
@@ -954,6 +1031,9 @@ async function hasServerPermission(rpcBase: string): Promise<boolean> {
 // Message handling
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg: BgRequest, sender, sendResponse) => {
+  // A user-driven wallet action postpones the idle lock. `get-state` runs on
+  // every UI render, so it must not count as activity.
+  if (sender.tab == null && msg.type !== 'anp-wallet/get-state') void armAutoLock()
   void handle(msg, sender)
     .then(sendResponse)
     .catch((e) => {
@@ -1005,6 +1085,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
     case 'anp-wallet/get-state': {
       const account = await loadAccount()
       const registry = await loadServers()
+      const settings = await loadSettings()
       return {
         status: 'ok',
         unlocked: Boolean(unlocked),
@@ -1013,6 +1094,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
         pending: [...pending.values()].map((p) => buildPendingState(p, unlocked?.identity?.did ?? null)),
         servers: registry.servers,
         defaultServerId: registry.defaultServerId,
+        autoLockMinutes: settings.autoLockMinutes,
       }
     }
 
@@ -1041,12 +1123,21 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
       }
       const err = activateKey(account, activeWallet.id, activeWallet.activeKeyIndex)
       if (err) return { status: 'error', error: err }
+      void armAutoLock()
       return { status: 'ok' }
     }
 
     case 'anp-wallet/lock':
-      unlocked = null
+      lockNow()
       return { status: 'ok' }
+
+    case 'anp-wallet/set-auto-lock': {
+      if (!isAutoLockMinutes(msg.minutes)) return { status: 'error', error: '锁定时间不合法' }
+      await saveSettings({ autoLockMinutes: msg.minutes })
+      if (unlocked) void armAutoLock()
+      else clearAutoLock()
+      return { status: 'ok', autoLockMinutes: msg.minutes }
+    }
 
     case 'anp-wallet/create-account': {
       const existing = await loadAccount()
@@ -1083,6 +1174,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
       }
       const err = activateKey(account, id, wallet.activeKeyIndex)
       if (err) return { status: 'error', error: err }
+      void armAutoLock()
       return {
         status: 'ok',
         did: key.did,
@@ -1119,6 +1211,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
       unlocked.secrets.set(id, secret)
       const err = activateKey(account, id, wallet.activeKeyIndex)
       if (err) return { status: 'error', error: err }
+      void armAutoLock()
       return { status: 'ok', walletId: id, keyIndex: wallet.activeKeyIndex }
     }
 
@@ -1135,7 +1228,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
       if (account.wallets.length === 0) {
         account.activeWalletId = null
         await saveAccount(account)
-        unlocked = null
+        lockNow()
         return { status: 'ok' }
       }
 
@@ -1818,3 +1911,6 @@ async function approve(
 chrome.runtime.onInstalled.addListener(() => {
   refreshBadge()
 })
+
+// Follow wallet UI lifetime for the "lock immediately" setting.
+chrome.runtime.onConnect?.addListener(watchUiPort)
