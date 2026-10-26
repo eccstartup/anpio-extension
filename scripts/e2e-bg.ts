@@ -1,10 +1,19 @@
 // Integration test: run the BUILT background service worker (dist/background.js)
-// inside a VM with a mocked `chrome`, drive the full v4 multi-wallet flow, and
-// dump the delivered signature for the official `verify_official.py` cross-check.
+// inside a VM with a mocked `chrome` + `fetch`, then drive the full v5 flow:
+// migration, server registry, mnemonic/imported wallets, email + did_document
+// registration, verify-existing, server rebind, legacy aggregate, and signing.
 // This exercises the same built artifact the browser loads, not just the source.
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
-import { generateMnemonicPhrase } from '../src/lib/anp'
+import { base58, base64, base64urlnopad } from '@scure/base'
+import {
+  buildAwikiIdentity,
+  generateMnemonicPhrase,
+  multibaseEd25519,
+  parseEd25519PrivateKey,
+  publicKeyFromPrivateKey,
+} from '../src/lib/anp'
+import { AWIKI_CLIENT_VERSION } from '../src/lib/awiki'
 
 // ---- mock chrome -----------------------------------------------------------
 let bgHandler: (msg: unknown, sender: unknown, sendResponse: (r: unknown) => void) => void = () => {}
@@ -38,6 +47,10 @@ let openPopupCalls = 0
       },
     },
   },
+  permissions: {
+    contains: async () => true,
+    request: async () => true,
+  },
   action: {
     setBadgeText: async () => {},
     setBadgeBackgroundColor: async () => {},
@@ -54,390 +67,1118 @@ let openPopupCalls = 0
   },
 }
 
+// ---- mock fetch / registration servers -------------------------------------
+type Call = {
+  url: string
+  host: string
+  path: string
+  method: string
+  headers: Record<string, string>
+  body: any
+}
+
+const calls: Call[] = []
+const didRegisters: Call[] = []
+const aggregateRegisters: Call[] = []
+const emailSends: Call[] = []
+const lookups: Call[] = []
+
+const MOCK_SERVICE: Record<string, unknown> = {
+  id: 'did:wba:awiki.ai#anp-message',
+  type: 'ANPMessageService',
+  serviceEndpoint: 'https://awiki.ai/anp-im/rpc',
+  serviceDid: 'did:wba:awiki.ai',
+  profiles: ['anp.core.binding.v1', 'awiki.test.marker'],
+  authSchemes: ['bearer', 'didwba'],
+  securityProfiles: ['transport-protected'],
+  mockUnknownField: { keep: 'verbatim' },
+}
+
+function serviceFor(didDomain: string): Record<string, unknown> {
+  return {
+    id: `did:wba:${didDomain}#anp-message`,
+    type: 'ANPMessageService',
+    serviceEndpoint: `https://${didDomain}/anp-im/rpc`,
+    serviceDid: `did:wba:${didDomain}`,
+    profiles: ['anp.core.binding.v1', `marker.${didDomain}`],
+    authSchemes: ['bearer', 'didwba'],
+    securityProfiles: ['transport-protected'],
+    mockUnknownField: { domain: didDomain },
+  }
+}
+
+const DISCOVERY: Record<string, { didDomain: string; service: Record<string, unknown> }> = {
+  'awiki.ai': { didDomain: 'awiki.ai', service: MOCK_SERVICE },
+  'reg.example.test': { didDomain: 'reg.example.test', service: serviceFor('reg.example.test') },
+  'wrong.example.test': { didDomain: 'wrong.example.test', service: serviceFor('wrong.example.test') },
+  'mismatch.example.test': { didDomain: 'other.test', service: serviceFor('other.test') },
+}
+
+const emailVerified = new Set<string>()
+let lookupMode: 'match' | 'mismatch' | 'missing' | 'unsupported' = 'match'
+let lookupDid = ''
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+function parseBody(init?: RequestInit): any {
+  const raw = typeof init?.body === 'string' ? init.body : ''
+  if (!raw) return undefined
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
+}
+
+function headersOf(init?: RequestInit): Record<string, string> {
+  const out: Record<string, string> = {}
+  new Headers(init?.headers).forEach((value, key) => {
+    out[key.toLowerCase()] = value
+  })
+  return out
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.href
+  return input.url
+}
+
+globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const raw = requestUrl(input)
+  const url = new URL(raw)
+  const host = url.hostname
+  const call: Call = {
+    url: raw,
+    host,
+    path: url.pathname,
+    method: (init?.method ?? 'GET').toUpperCase(),
+    headers: headersOf(init),
+    body: parseBody(init),
+  }
+  calls.push(call)
+
+  if (call.path === '/.well-known/did.json') {
+    const found = DISCOVERY[host]
+    if (!found) return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } })
+    return json({ id: `did:wba:${found.didDomain}`, service: [found.service] })
+  }
+
+  if (call.path === '/user-service/v1/auth/email-status') {
+    if (host !== 'awiki.ai') {
+      return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } })
+    }
+    const email = (url.searchParams.get('email') ?? '').toLowerCase()
+    const handle = url.searchParams.get('handle') ?? ''
+    const verified = emailVerified.has(`${email}|${handle}`)
+    return json(verified ? { verified: true, verified_at: '2026-10-26T00:00:00Z' } : { verified: false })
+  }
+
+  if (call.path === '/user-service/v1/auth/email-send') {
+    if (host !== 'awiki.ai') {
+      return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } })
+    }
+    emailSends.push(call)
+    return json({ message: 'verification email sent' })
+  }
+
+  if (call.path === '/user-service/v1/did-auth/rpc') {
+    const rpc = call.body ?? {}
+    if (rpc.method === 'challenge') {
+      return json({
+        jsonrpc: '2.0',
+        id: rpc.id,
+        result: {
+          challenge: 'c'.repeat(32),
+          created_at: '2026-10-26T00:00:00Z',
+          expires_at: '2026-10-26T00:05:00Z',
+          expires_in: 300,
+        },
+      })
+    }
+    if (rpc.method === 'register') {
+      const params = rpc.params ?? {}
+      if (params.did_document) {
+        didRegisters.push(call)
+        return json({
+          jsonrpc: '2.0',
+          id: rpc.id,
+          result: {
+            state: 'registered',
+            did: params.did_document.id,
+            user_id: 'user-1',
+            access_token: 'secret-token',
+            handle: params.handle,
+            domain: host,
+            full_handle: `${params.handle}.${host}`,
+            binding_generation: 1,
+          },
+        })
+      }
+      aggregateRegisters.push(call)
+      return json({
+        jsonrpc: '2.0',
+        id: rpc.id,
+        result: {
+          did: params.submitting_did,
+          dids: params.ad?.dids,
+          access_token: 'legacy-token',
+          user_id: 'legacy-user',
+        },
+      })
+    }
+    return json({ jsonrpc: '2.0', id: rpc.id, error: { code: -32601, message: 'method_not_found' } })
+  }
+
+  if (call.path === '/user-service/v1/handle/rpc') {
+    lookups.push(call)
+    if (lookupMode === 'unsupported') {
+      return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } })
+    }
+    const rpc = call.body ?? {}
+    if (lookupMode === 'missing') {
+      return json({ jsonrpc: '2.0', id: rpc.id, error: { code: -32001, message: 'not_found' } })
+    }
+    const did =
+      lookupMode === 'match' ? lookupDid : 'did:wba:awiki.ai:user:someone-else:e1_not-the-key'
+    return json({
+      jsonrpc: '2.0',
+      id: rpc.id,
+      result: {
+        did,
+        user_id: 'user-existing',
+        handle: rpc.params?.handle,
+        full_handle: rpc.params?.handle,
+        status: 'active',
+      },
+    })
+  }
+
+  return json({ error: 'not found' }, 404)
+}) as typeof fetch
+
 // ---- load the built worker --------------------------------------------------
 const src = readFileSync(new URL('../dist/background.js', import.meta.url), 'utf8')
 vm.runInThisContext(src, { filename: 'background.js' })
 
+// ---- test helpers -----------------------------------------------------------
+const password = 'correct-horse-battery'
 const mnemonicA =
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
-const mnemonicB = generateMnemonicPhrase(256)
 const TARGET = 'http://localhost:3000/api/login/anp/verify'
 const nonce = 'f'.repeat(32)
-const password = 'correct-horse-battery'
+const stamp = Date.now().toString(36).slice(-6)
 
 type Resp<T = Record<string, unknown>> = T & { status: string; error?: string }
-const assert = (cond: unknown, msg: string) => {
-  if (!cond) throw new Error('ASSERT FAILED: ' + msg)
+interface KeyLike {
+  index: number
+  handle: string
+  did: string
+  keyid: string
+  publicKeyMultibase: string
+  didDocument: Record<string, unknown>
+  registered?: boolean
+  accessToken?: string
 }
-
-type State = {
-  status: string
-  unlocked: boolean
-  account: {
-    version: number
-    wallets: WalletStored[]
-    activeWalletId: string | null
-  }
-  activeRef: { walletId: string; keyIndex: number } | null
-  pending: unknown[]
-}
-type WalletStored = {
+interface WalletLike {
+  kind: string
   id: string
   label: string
   handle: string
-  registered?: boolean
+  salt: string
+  iv: string
+  ciphertext: string
   nextKeyIndex: number
   activeKeyIndex: number
   primaryKeyIndex: number
-  keys: { index: number; did: string; keyid: string; publicKeyMultibase: string; handle: string; registered?: boolean }[]
+  keys: KeyLike[]
+  registered?: boolean
+  handleDocuments?: Record<string, unknown>
+  serverId: string | null
+  didDomain: string
+  registerMode?: string
+}
+interface AccountLike {
+  version: number
+  wallets: WalletLike[]
+  activeWalletId: string | null
+}
+interface ServerLike {
+  id: string
+  label: string
+  rpcBase: string
+  didDomain: string
+  builtin?: boolean
+  registerMode?: string
+}
+interface StateLike {
+  status: string
+  unlocked: boolean
+  account: AccountLike | null
+  activeRef: { walletId: string; keyIndex: number } | null
+  pending: unknown[]
+  servers: ServerLike[]
+  defaultServerId: string
 }
 
-async function bg(msg: unknown): Promise<unknown> {
-  return chrome.runtime.sendMessage(msg)
+const assert = (cond: unknown, msg: string) => {
+  if (!cond) throw new Error('ASSERT FAILED: ' + msg)
+}
+const eq = <T>(actual: T, expected: T, msg: string) => {
+  if (actual !== expected) {
+    throw new Error(`ASSERT FAILED: ${msg}: got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`)
+  }
+}
+const eqJson = (actual: unknown, expected: unknown, msg: string) => {
+  eq(JSON.stringify(actual), JSON.stringify(expected), msg)
+}
+const must = <T>(value: T | null | undefined, msg: string): T => {
+  assert(value != null, msg)
+  return value as T
+}
+const assertThrows = (fn: () => unknown, substr: string, msg: string) => {
+  try {
+    fn()
+  } catch (e) {
+    const text = e instanceof Error ? e.message : String(e)
+    assert(text.includes(substr), `${msg}: unexpected error "${text}" (wanted "${substr}")`)
+    return
+  }
+  throw new Error('ASSERT FAILED: ' + msg + ' (no error thrown)')
+}
+
+async function bg<T = any>(msg: Record<string, unknown>): Promise<T> {
+  return (await chrome.runtime.sendMessage(msg)) as T
+}
+
+function stateAccount(state: StateLike): AccountLike {
+  return must(state.account, 'expected an account')
+}
+function walletFrom(state: StateLike, id: string): WalletLike {
+  return must(stateAccount(state).wallets.find((w) => w.id === id), `wallet ${id} missing`)
+}
+function rawAccount(): AccountLike {
+  return must(store.get('anp_account') as AccountLike | undefined, 'raw account missing')
+}
+function rawJson(): string {
+  return JSON.stringify(store.get('anp_account'))
+}
+function testSeed(n: number): Uint8Array {
+  return Uint8Array.from({ length: 32 }, (_, i) => (i * 7 + n * 13 + 1) & 0xff)
+}
+function seedHex(seed: Uint8Array): string {
+  return Array.from(seed, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+function seedKey(seed: Uint8Array): string {
+  return Array.from(seed).join(',')
+}
+function concatSeedPub(seed: Uint8Array): Uint8Array {
+  const pub = publicKeyFromPrivateKey(seed)
+  const out = new Uint8Array(64)
+  out.set(seed, 0)
+  out.set(pub, 32)
+  return out
+}
+function hasNoSecret(json: string, seed: Uint8Array, label: string): void {
+  assert(!json.includes(seedHex(seed)), `${label}: account must not contain hex seed`)
+  assert(!json.includes(base64.encode(seed)), `${label}: account must not contain base64 seed`)
+  assert(!json.includes(base64urlnopad.encode(seed)), `${label}: account must not contain base64url seed`)
+  assert(!json.includes('z' + base58.encode(seed)), `${label}: account must not contain base58 seed`)
+}
+function serviceIn(doc: Record<string, unknown>): Record<string, unknown> {
+  const services = Array.isArray(doc.service) ? (doc.service as Record<string, unknown>[]) : []
+  eq(services.filter((s) => s.type === 'ANPMessageService').length, 1, 'exactly one ANPMessageService')
+  return services.find((s) => s.type === 'ANPMessageService') as Record<string, unknown>
+}
+function expectedService(mock: Record<string, unknown>, did: string): Record<string, unknown> {
+  return { ...mock, id: `${did}#message`, type: 'ANPMessageService' }
+}
+function assertVersionHeader(call: Call, label: string): void {
+  eq(call.headers['x-awiki-client-version'], AWIKI_CLIENT_VERSION, `${label}: client version header`)
 }
 
 async function main() {
   // =========================================================================
-  // SCENARIO 1 — v3 → v4 migration (kept only to verify the collapse is safe).
-  // Seed a v3 account whose identity keys have NON-monotonic index gaps, so a
-  // buggy migration that used `key.index` for the active ref would exceed the
-  // key count. The correct migration uses the COLLAPSED ARRAY position.
+  // 1. v4 → v5 migration: server binding, kind, aggregate inference, token drop.
   // =========================================================================
-  const seedV3 = {
-    version: 3,
-    salt: 'c2FsdA',
-    iv: 'aXY',
-    ciphertext: 'Y2lwaGVydGV4dA',
-    identities: [
+  const v4 = {
+    version: 4,
+    activeWalletId: 'w-awiki',
+    wallets: [
       {
-        id: 'id1',
-        label: '身份 1',
+        id: 'w-awiki',
+        label: 'awiki',
+        handle: 'alice.awiki.ai',
+        salt: 'c2FsdA',
+        iv: 'aXY',
+        ciphertext: 'Y2lwaGVydGV4dA',
+        nextKeyIndex: 1,
         activeKeyIndex: 0,
+        primaryKeyIndex: 0,
+        registered: true,
+        handleDocuments: { type: 'ANPDIDDocument', id: 'did:wba:awiki.ai:user:alice:e1_a' },
         keys: [
-          { index: 0, handle: 'a.localhost', did: 'did:x:a', keyid: 'k1', publicKeyMultibase: 'z1', didDocument: {}, registered: true },
-          { index: 5, handle: '', did: 'did:x:b', keyid: 'k2', publicKeyMultibase: 'z2', didDocument: {}, registered: false },
+          {
+            index: 0,
+            handle: 'alice.awiki.ai',
+            did: 'did:wba:awiki.ai:user:alice:e1_a',
+            keyid: 'did:wba:awiki.ai:user:alice:e1_a#key-1',
+            publicKeyMultibase: 'zA',
+            didDocument: {},
+            registered: true,
+            accessToken: 'stale-token',
+          },
         ],
       },
       {
-        id: 'id2',
-        label: '身份 2',
-        activeKeyIndex: 1,
+        id: 'w-local',
+        label: 'local',
+        handle: '',
+        salt: 'c2FsdA',
+        iv: 'aXY',
+        ciphertext: 'Y2lwaGVydGV4dA',
+        nextKeyIndex: 1,
+        activeKeyIndex: 0,
+        primaryKeyIndex: 0,
         keys: [
-          { index: 7, handle: '', did: 'did:x:c', keyid: 'k3', publicKeyMultibase: 'z3', didDocument: {}, registered: false },
-          { index: 8, handle: '', did: 'did:x:d', keyid: 'k4', publicKeyMultibase: 'z4', didDocument: {}, registered: false },
+          {
+            index: 0,
+            handle: 'local.localhost',
+            did: 'did:wba:localhost:user:local:e1_b',
+            keyid: 'did:wba:localhost:user:local:e1_b#key-1',
+            publicKeyMultibase: 'zB',
+            didDocument: {},
+          },
+        ],
+      },
+      {
+        id: 'w-agg',
+        label: 'aggregate',
+        handle: 'agg.localhost',
+        salt: 'c2FsdA',
+        iv: 'aXY',
+        ciphertext: 'Y2lwaGVydGV4dA',
+        nextKeyIndex: 1,
+        activeKeyIndex: 0,
+        primaryKeyIndex: 0,
+        registered: true,
+        handleDocuments: { type: 'ANPHandleAggregate', dids: ['did:wba:localhost:user:agg:e1_c'] },
+        keys: [
+          {
+            index: 0,
+            handle: 'agg.localhost',
+            did: 'did:wba:localhost:user:agg:e1_c',
+            keyid: 'did:wba:localhost:user:agg:e1_c#key-1',
+            publicKeyMultibase: 'zC',
+            didDocument: {},
+            registered: true,
+          },
         ],
       },
     ],
-    nextKeyIndex: 4,
-    activeIdentityId: 'id2',
   }
-  store.set('anp_account', seedV3)
-  const mig = (await bg({ type: 'anp-wallet/get-state' })) as State
-  console.log('migration:', 'version=', mig.account.version, 'wallets=', mig.account.wallets.length, 'activeKeyIndex=', mig.account.wallets[0].activeKeyIndex)
-  assert(mig.account.version === 4, 'expected v4 after migration')
-  assert(mig.account.wallets.length === 1, 'expected 1 wallet after migration')
-  const mw = mig.account.wallets[0]
-  assert(mw.label === '身份 2', 'migration should carry the active identity label')
-  assert(mw.nextKeyIndex === 4, 'migration should carry nextKeyIndex')
-  assert(mw.keys.map((k) => k.index).join(',') === '0,5,7,8', 'migration should preserve identity-then-key order')
-  // The active key was the 2nd key (array pos 1) in identity id2 → collapse to array pos 3.
-  // Using key.index (8) here would be ~2x the key count → proves the dual-index fix.
-  assert(mw.activeKeyIndex === 3, 'activeKeyIndex must be the collapsed ARRAY position (3), not key.index (8)')
-  assert(mig.activeRef?.keyIndex === 3, 'activeRef must point at array position 3')
-  assert(mw.primaryKeyIndex === 3, 'migration should default primaryKeyIndex to the active key')
+  store.set('anp_account', v4)
+  const mig = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  eq(stateAccount(mig).version, 5, 'migration must produce version 5')
+  const mAwiki = walletFrom(mig, 'w-awiki')
+  const mLocal = walletFrom(mig, 'w-local')
+  const mAgg = walletFrom(mig, 'w-agg')
+  eq(mAwiki.kind, 'mnemonic', 'migrated wallet kind')
+  eq(mAwiki.didDomain, 'awiki.ai', 'awiki wallet DID domain')
+  eq(mAwiki.serverId, 'awiki.ai', 'awiki wallet binds builtin server')
+  eq(mAwiki.registerMode, 'did_document', 'awiki wallet register mode')
+  eq(mLocal.didDomain, 'localhost', 'localhost wallet DID domain')
+  eq(mLocal.serverId, null, 'localhost wallet has no server')
+  eq(mAgg.registerMode, 'aggregate', 'legacy aggregate inferred from handleDocuments')
+  eq(mAgg.serverId, null, 'aggregate wallet uses internal legacy server')
+  assert(!('accessToken' in mAwiki.keys[0]), 'migration must strip key accessToken')
+  assert(!rawJson().includes('accessToken'), 'stored account must not contain accessToken')
+  console.log('migration v4→v5: ok')
   store.clear()
 
   // =========================================================================
-  // SCENARIO 2 — create + multi-wallet + key management.
+  // 2. Server registry CRUD.
   // =========================================================================
-  const created = (await bg({
+  let st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  eq(st.servers.length, 1, 'registry starts with only builtin awiki')
+  eq(st.defaultServerId, 'awiki.ai', 'default server starts awiki.ai')
+  assert(st.servers[0].builtin === true, 'builtin flag')
+
+  const badScheme = await bg<Resp>({ type: 'anp-wallet/add-server', rpcBase: 'http://reg.example.test', didDomain: 'reg.example.test' })
+  eq(badScheme.status, 'error', 'http server rejected')
+  assert(must(badScheme.error, 'error text').includes('HTTPS'), 'http rejection mentions HTTPS')
+
+  const add1 = await bg<Resp<{ server: ServerLike }>>({
+    type: 'anp-wallet/add-server',
+    rpcBase: 'https://reg.example.test/',
+    didDomain: 'reg.example.test',
+    label: 'Reg',
+  })
+  eq(add1.status, 'ok', 'add custom HTTPS server')
+  const custom1 = must(add1.server, 'added server')
+  eq(custom1.rpcBase, 'https://reg.example.test', 'rpcBase normalized without trailing slash')
+  eq(custom1.didDomain, 'reg.example.test', 'custom DID domain')
+
+  const dup = await bg<Resp>({
+    type: 'anp-wallet/add-server',
+    rpcBase: 'https://reg.example.test',
+    didDomain: 'reg.example.test',
+  })
+  eq(dup.status, 'error', 'duplicate rpcBase rejected')
+
+  const tested = await bg<Resp<{ didDomain: string; source: string }>>({
+    type: 'anp-wallet/test-server',
+    serverId: custom1.id,
+  })
+  eq(tested.status, 'ok', 'test-server discovery')
+  eq(tested.didDomain, 'reg.example.test', 'discovered custom domain')
+  eq(tested.source, 'well-known', 'discovery source')
+
+  const addWrong = await bg<Resp<{ server: ServerLike }>>({
+    type: 'anp-wallet/add-server',
+    rpcBase: 'https://wrong.example.test',
+    didDomain: 'wrong.example.test',
+  })
+  const wrongServer = must(addWrong.server, 'wrong server')
+  const addMismatch = await bg<Resp<{ server: ServerLike }>>({
+    type: 'anp-wallet/add-server',
+    rpcBase: 'https://mismatch.example.test',
+    didDomain: 'mismatch.example.test',
+  })
+  const mismatchServer = must(addMismatch.server, 'mismatch server')
+  const wrongTest = await bg<Resp>({ type: 'anp-wallet/test-server', serverId: mismatchServer.id })
+  eq(wrongTest.status, 'error', 'discovered domain mismatch rejected')
+  assert(must(wrongTest.error, 'mismatch error').includes('不一致'), 'mismatch error explains domain')
+
+  const setCustom = await bg<Resp>({ type: 'anp-wallet/set-default-server', serverId: custom1.id })
+  eq(setCustom.status, 'ok', 'set custom default')
+  const delBuiltin = await bg<Resp>({ type: 'anp-wallet/remove-server', serverId: 'awiki.ai' })
+  eq(delBuiltin.status, 'error', 'builtin server cannot be deleted')
+  const delDefaultCustom = await bg<Resp>({ type: 'anp-wallet/remove-server', serverId: custom1.id })
+  eq(delDefaultCustom.status, 'ok', 'custom default server removable')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  eq(st.defaultServerId, 'awiki.ai', 'deleting default custom falls back to awiki')
+
+  const add2 = await bg<Resp<{ server: ServerLike }>>({
+    type: 'anp-wallet/add-server',
+    rpcBase: 'https://reg.example.test',
+    didDomain: 'reg.example.test',
+    label: 'Reg',
+  })
+  const custom2 = must(add2.server, 're-added custom server')
+  const customServerId = custom2.id
+  await bg({ type: 'anp-wallet/remove-server', serverId: wrongServer.id })
+  await bg({ type: 'anp-wallet/remove-server', serverId: mismatchServer.id })
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  eq(st.servers.length, 2, 'registry keeps builtin + custom')
+  eq(st.defaultServerId, 'awiki.ai', 'default back to awiki')
+  console.log('server registry: ok')
+
+  // =========================================================================
+  // 3. Mnemonic wallet creation, derivation, export.
+  // =========================================================================
+  const created = await bg<Resp<{ did: string }>>({
     type: 'anp-wallet/create-account',
+    source: 'mnemonic',
     mnemonic: mnemonicA,
     password,
-    handle: 'agent-aaa.awiki.ai',
-  })) as Resp<{ did: string; didDocument: Record<string, unknown> }>
-  console.log('create-account:', created.status, created.did)
-  assert(created.status === 'ok', 'create-account failed')
-  assert(Boolean(created.did && created.didDocument), 'create-account should mint a DID when handle given')
-  const didA0 = created.did
+  })
+  eq(created.status, 'ok', 'create mnemonic account')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  const walletAId = must(stateAccount(st).activeWalletId, 'active wallet after create')
+  let walletA = walletFrom(st, walletAId)
+  eq(walletA.kind, 'mnemonic', 'wallet A kind')
+  eq(walletA.didDomain, 'awiki.ai', 'wallet A domain')
+  eq(walletA.serverId, 'awiki.ai', 'wallet A server')
+  eq(walletA.keys.length, 1, 'wallet A has key 0')
+  eq(walletA.nextKeyIndex, 1, 'wallet A nextKeyIndex')
+  assert(walletA.keys[0].did.includes(walletAId.slice(0, 8)), 'placeholder handle uses wallet id prefix')
+  assert(!rawJson().includes(mnemonicA), 'stored account must not contain plaintext mnemonic')
 
-  const st0 = (await bg({ type: 'anp-wallet/get-state' })) as State
-  assert(st0.account.version === 4, 'expected v4')
-  assert(st0.account.wallets.length === 1, 'expected 1 wallet after create')
-  assert(st0.account.wallets[0].keys.length === 1, 'expected 1 key after create-with-handle')
-  assert(st0.account.wallets[0].nextKeyIndex === 1, 'expected nextKeyIndex=1')
-  assert(st0.unlocked === true, 'create should auto-unlock')
+  const addKeyA1 = await bg<Resp<{ keyIndex: number }>>({ type: 'anp-wallet/add-key', walletId: walletAId })
+  eq(addKeyA1.status, 'ok', 'add second key to mnemonic wallet')
+  eq(addKeyA1.keyIndex, 1, 'second key array position')
 
-  // Add a SECOND wallet with a DIFFERENT mnemonic → also auto-unlocks? add-wallet
-  // requires an unlocked session, which create established.
-  const addB = (await bg({
+  const exportA = await bg<Resp<{ kind: string; mnemonic: string }>>({ type: 'anp-wallet/export-secret' })
+  eq(exportA.status, 'ok', 'export mnemonic wallet')
+  eq(exportA.kind, 'mnemonic', 'export kind mnemonic')
+  eq(exportA.mnemonic, mnemonicA, 'export returns the mnemonic')
+  console.log('mnemonic wallet: ok')
+
+  // =========================================================================
+  // 4. Ed25519 import parser across encodings.
+  // =========================================================================
+  const seedB = testSeed(2)
+  eq(seedKey(parseEd25519PrivateKey(seedHex(seedB)).seed), seedKey(seedB), 'hex seed')
+  eq(seedKey(parseEd25519PrivateKey('0x' + seedHex(seedB)).seed), seedKey(seedB), '0x hex seed')
+  eq(seedKey(parseEd25519PrivateKey(base64.encode(seedB)).seed), seedKey(seedB), 'base64 seed')
+  eq(seedKey(parseEd25519PrivateKey(base64urlnopad.encode(seedB)).seed), seedKey(seedB), 'base64url seed')
+  eq(seedKey(parseEd25519PrivateKey('z' + base58.encode(seedB)).seed), seedKey(seedB), 'base58 seed')
+  const jwkB = JSON.stringify({
+    kty: 'OKP',
+    crv: 'Ed25519',
+    d: base64urlnopad.encode(seedB),
+    x: base64urlnopad.encode(publicKeyFromPrivateKey(seedB)),
+  })
+  eq(seedKey(parseEd25519PrivateKey(jwkB).seed), seedKey(seedB), 'JWK seed')
+  const seedPubB = concatSeedPub(seedB)
+  eq(seedKey(parseEd25519PrivateKey(seedHex(seedPubB)).seed), seedKey(seedB), '64-byte seed||pub')
+  eq(seedKey(parseEd25519PrivateKey(base64.encode(seedPubB)).seed), seedKey(seedB), '64-byte base64')
+  assertThrows(() => parseEd25519PrivateKey(base64urlnopad.encode(new Uint8Array(31))), '无法识别私钥格式', '31-byte key rejected')
+  assertThrows(
+    () => parseEd25519PrivateKey(JSON.stringify({ kty: 'OKP', crv: 'X25519', d: base64urlnopad.encode(seedB) })),
+    'Ed25519',
+    'non-Ed25519 JWK rejected',
+  )
+  const mismatched = seedPubB.slice()
+  mismatched[63] ^= 0xff
+  assertThrows(() => parseEd25519PrivateKey(seedHex(mismatched)), '不一致', 'mismatched 64-byte key rejected')
+  console.log('import parser: ok')
+
+  // =========================================================================
+  // 5. Imported wallet: create, secrets at rest, key add/delete, export.
+  // =========================================================================
+  const addB = await bg<Resp<{ walletId: string; keyIndex: number }>>({
     type: 'anp-wallet/add-wallet',
-    mnemonic: mnemonicB,
-    handle: 'agent-bbb',
-    label: '工作',
-  })) as Resp<{ walletId: string; keyIndex: number }>
-  console.log('add-wallet B:', addB.status, addB.walletId)
-  assert(addB.status === 'ok', 'add-wallet B failed')
-  const walletAId = st0.account.activeWalletId
+    source: 'imported',
+    privateKey: '0x' + seedHex(seedB),
+    label: 'Imported',
+  })
+  eq(addB.status, 'ok', 'create imported wallet')
   const walletBId = addB.walletId
-  assert(walletBId !== walletAId, 'second wallet must have its own id')
+  const pubB = publicKeyFromPrivateKey(seedB)
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  let walletB = walletFrom(st, walletBId)
+  eq(walletB.kind, 'imported', 'wallet B kind')
+  eq(walletB.keys.length, 1, 'wallet B key count')
+  eq(walletB.keys[0].publicKeyMultibase, multibaseEd25519(pubB), 'wallet B derived public key')
+  hasNoSecret(rawJson(), seedB, 'wallet B create')
 
-  const listed = (await bg({ type: 'anp-wallet/list-wallets' })) as Resp<{
-    wallets: { id: string; label: string; keyCount: number; registeredCount: number }[]
-    activeRef: { walletId: string; keyIndex: number }
-  }>
-  console.log('list-wallets:', 'count=', listed.wallets.length, 'active=', listed.activeRef.walletId === walletBId ? 'B' : 'A')
-  assert(listed.wallets.length === 2, 'expected 2 wallets')
-  assert(listed.activeRef.walletId === walletBId, 'adding a wallet should make it active')
-  const wA = listed.wallets.find((w) => w.id === walletAId)!
-  const wB = listed.wallets.find((w) => w.id === walletBId)!
-  assert(wA.label === 'agent-aaa' && wB.label === '工作', 'labels should default to handle local part / carry explicit label')
+  const exportB = await bg<Resp<{ kind: string; keys: { index: number; privateKey: string }[] }>>({
+    type: 'anp-wallet/export-secret',
+  })
+  eq(exportB.status, 'ok', 'export imported wallet')
+  eq(exportB.kind, 'imported', 'export kind imported')
+  eq(exportB.keys.length, 1, 'exported key count')
+  eq(exportB.keys[0].index, 0, 'exported key index')
+  eq(exportB.keys[0].privateKey, base64urlnopad.encode(seedB), 'exported seed')
 
-  // Active is B now → get-identity returns B's DID, distinct from A's.
-  const idelB = (await bg({ type: 'anp-wallet/get-identity' })) as { did: string; didDocument: Record<string, unknown> }
-  const didB0 = idelB.did
-  console.log('get-identity (active=B):', didB0)
-  assert(didB0 !== didA0, 'different mnemonics must yield different DIDs')
+  const seedC = testSeed(3)
+  const addKeyB1 = await bg<Resp<{ keyIndex: number }>>({
+    type: 'anp-wallet/add-key',
+    walletId: walletBId,
+    privateKey: seedHex(seedC),
+  })
+  eq(addKeyB1.status, 'ok', 'add imported key')
+  eq(addKeyB1.keyIndex, 1, 'imported key array position')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  walletB = walletFrom(st, walletBId)
+  eq(walletB.keys.length, 2, 'wallet B now has two keys')
+  eq(walletB.nextKeyIndex, 2, 'wallet B nextKeyIndex after import')
+  hasNoSecret(rawJson(), seedC, 'wallet B add-key')
 
-  // Switch back to A.
-  const selA = (await bg({ type: 'anp-wallet/select-wallet', walletId: walletAId })) as Resp
-  assert(selA.status === 'ok', 'select-wallet A failed')
-  const idelA = (await bg({ type: 'anp-wallet/get-identity' })) as { did: string }
-  assert(idelA.did === didA0, 'switch to A should restore A DID')
+  const dupKey = await bg<Resp>({ type: 'anp-wallet/add-key', walletId: walletBId, privateKey: seedHex(seedC) })
+  eq(dupKey.status, 'error', 'duplicate imported key rejected')
+  assert(must(dupKey.error, 'dup error').includes('已在此钱包'), 'duplicate message')
 
-  // Add a key to A, then select it as active.
-  const addKeyA = (await bg({ type: 'anp-wallet/add-key', walletId: walletAId })) as Resp<{ keyIndex: number }>
-  console.log('add-key A:', addKeyA.status, 'keyIndex=', addKeyA.keyIndex)
-  assert(addKeyA.status === 'ok' && addKeyA.keyIndex === 1, 'second key should sit at array position 1')
-  const stA1 = (await bg({ type: 'anp-wallet/get-state' })) as State
-  assert(stA1.account.wallets.find((w) => w.id === walletAId)!.nextKeyIndex === 2, 'nextKeyIndex should be 2 after add-key')
+  const cipherBefore = walletB.ciphertext
+  const delKeyB = await bg<Resp>({ type: 'anp-wallet/delete-key', walletId: walletBId, keyIndex: 1 })
+  eq(delKeyB.status, 'ok', 'delete imported key')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  walletB = walletFrom(st, walletBId)
+  eq(walletB.keys.length, 1, 'one key after delete')
+  assert(walletB.ciphertext !== cipherBefore, 'delete re-encrypts the imported secret blob')
+  hasNoSecret(rawJson(), seedB, 'wallet B after delete')
+  assert(!rawJson().includes(base64urlnopad.encode(seedC)), 'deleted imported seed removed from blob')
 
-  const selActive = (await bg({ type: 'anp-wallet/select-active', walletId: walletAId, keyIndex: 1 })) as Resp
-  assert(selActive.status === 'ok', 'select-active to A key1 failed')
-  const idelA1 = (await bg({ type: 'anp-wallet/get-identity' })) as { did: string }
-  assert(idelA1.did !== didA0, 'selecting key 1 should switch A to a different DID')
+  const mnemonicKey = await bg<Resp>({ type: 'anp-wallet/add-key', walletId: walletAId, privateKey: seedHex(seedB) })
+  eq(mnemonicKey.status, 'error', 'mnemonic wallet rejects imported key')
+  assert(must(mnemonicKey.error, 'mnemonic key error').includes('助记词钱包'), 'mnemonic key error message')
 
-  // Delete the active key → activeKeyIndex clamps back to the remaining key.
-  const delK = (await bg({ type: 'anp-wallet/delete-key', walletId: walletAId, keyIndex: 1 })) as Resp
-  assert(delK.status === 'ok', 'delete-key failed')
-  const stA2 = (await bg({ type: 'anp-wallet/get-state' })) as State
-  const wApost = stA2.account.wallets.find((w) => w.id === walletAId)!
-  assert(wApost.keys.length === 1, 'should have 1 key after delete')
-  assert(wApost.activeKeyIndex === 0, 'activeKeyIndex should clamp back to 0')
-
-  // Refuse to delete the last remaining key.
-  const delKLast = (await bg({ type: 'anp-wallet/delete-key', walletId: walletAId, keyIndex: 0 })) as Resp
-  assert(delKLast.status === 'error', 'should refuse deleting the last key')
-
-  // =========================================================================
-  // SCENARIO 3 — switch-then-sign correctness. The delivered signature's DID
-  // MUST match the ACTIVE wallet, proving the right wallet mnemonic was used
-  // (the "valid Ed25519 but wrong DID" regression we guard against).
-  // =========================================================================
-  const selB2 = (await bg({ type: 'anp-wallet/select-wallet', walletId: walletBId })) as Resp
-  assert(selB2.status === 'ok', 'select-wallet B failed')
-  const idelB2 = (await bg({ type: 'anp-wallet/get-identity' })) as { did: string; didDocument: Record<string, unknown> }
-  assert(idelB2.did === didB0, 'active=B should give B DID')
-
-  // Lock (fresh SW) → identity still readable → sign stages while locked.
-  const locked = (await bg({ type: 'anp-wallet/lock' })) as Resp
-  assert(locked.status === 'ok', 'lock failed')
-  const identityLocked = (await bg({ type: 'anp-wallet/get-identity' })) as { did: string; didDocument: Record<string, unknown> }
-  console.log('get-identity (locked) did:', identityLocked.did)
-  assert(identityLocked.did === didB0, 'get-identity should work while locked')
-
-  const body = JSON.stringify({ nonce, didDocument: idelB2.didDocument })
-  const sign = (await bg({
-    type: 'anp-wallet/sign',
-    payload: { id: 'req-1', req: { url: TARGET, method: 'POST', body, nonce } },
-  })) as Resp<{ id: string }>
-  console.log('sign ack (locked):', sign.status, 'openPopup calls:', openPopupCalls)
-  assert(sign.status === 'pending', 'expected pending even while locked')
-  assert(openPopupCalls >= 1, 'expected openPopup() to fire')
-
-  const unlocked = (await bg({ type: 'anp-wallet/unlock', password })) as Resp
-  assert(unlocked.status === 'ok', 'unlock failed')
-  const approved = (await bg({ type: 'anp-wallet/approve', id: 'req-1' })) as Resp
-  assert(approved.status === 'ok', 'approve failed')
-  const delivered = tabMessages.find((m) => m.id === 'req-1')
-  assert(delivered && delivered.result, 'expected a delivered signature')
-  const deliveredDid = (delivered!.result as { did: string }).did
-  console.log('delivered did:', deliveredDid, '=== B did?', deliveredDid === didB0)
-  assert(deliveredDid === didB0, `delivered signature DID ${deliveredDid} must equal active wallet B DID ${didB0}`)
-  // Bug #1: the delivered signature carries the exact body it signed, whose inline
-  // didDocument matches the signing key (not the page's pre-built body).
-  const deliveredBody = (delivered!.result as { body: string }).body
-  const parsedBody = JSON.parse(deliveredBody)
-  assert(
-    JSON.stringify(parsedBody.didDocument) === JSON.stringify((delivered!.result as { didDocument: Record<string, unknown> }).didDocument),
-    'delivered body didDocument must match the signing key didDocument',
-  )
-  writeFileSync(
-    '/tmp/anp-ext-signed.json',
-    JSON.stringify(
-      { request_method: 'POST', request_url: TARGET, didDocument: delivered!.result?.didDocument, headers: (delivered!.result as { headers: Record<string, string> }).headers, body: deliveredBody },
-      null,
-      2,
-    ),
-  )
+  await bg({ type: 'anp-wallet/lock' })
+  const exportLocked = await bg<Resp>({ type: 'anp-wallet/export-secret' })
+  eq(exportLocked.status, 'error', 'export while locked fails')
+  eq(exportLocked.error, 'Locked', 'locked export error')
+  const unlockB = await bg<Resp>({ type: 'anp-wallet/unlock', password })
+  eq(unlockB.status, 'ok', 'unlock imported wallet')
+  console.log('imported wallet: ok')
 
   // =========================================================================
-  // SCENARIO 3b — approve with `sel` self-select. Active is B, but the user
-  // picks wallet A key 0 from the sign-approval chooser. The delivered signature
-  // MUST carry A-key0's DID (didA0), NOT the active wallet's DID (didB0). This
-  // proves the self-select path signs with the chosen key, not the active one.
+  // 6. verify-existing: match, DID mismatch, missing, unsupported.
   // =========================================================================
-  const bodySel = JSON.stringify({ nonce, didDocument: idelB2.didDocument })
-  const signSel = (await bg({
-    type: 'anp-wallet/sign',
-    payload: { id: 'req-sel', req: { url: TARGET, method: 'POST', body: bodySel, nonce } },
-  })) as Resp<{ id: string }>
-  assert(signSel.status === 'pending', 'sign (sel) should stage while unlocked')
-  const approveSel = (await bg({
-    type: 'anp-wallet/approve',
-    id: 'req-sel',
-    sel: { walletId: walletAId, keyIndex: 0 },
-  })) as Resp
-  assert(approveSel.status === 'ok', 'approve with sel failed')
-  const deliveredSel = tabMessages.find((m) => m.id === 'req-sel')
-  assert(deliveredSel && deliveredSel.result, 'expected a delivered signature for sel')
-  const deliveredSelDid = (deliveredSel!.result as { did: string }).did
-  console.log('delivered sel did:', deliveredSelDid, '=== A key0?', deliveredSelDid === didA0)
-  assert(deliveredSelDid === didA0, `self-selected signature DID ${deliveredSelDid} must equal chosen A key0 DID ${didA0}`)
-  // Bug #1: self-selecting a NON-active key must re-build the body so its inline
-  // didDocument is the chosen key's — the page's original body (B's doc) must NOT
-  // survive, otherwise the server can't resolve the keyid against it.
-  const selBody = JSON.parse((deliveredSel!.result as { body: string }).body)
-  assert(
-    JSON.stringify(selBody.didDocument) === JSON.stringify((deliveredSel!.result as { didDocument: Record<string, unknown> }).didDocument),
-    'self-selected body didDocument must be the chosen key, not the page body',
-  )
-  assert(
-    (deliveredSel!.result as { didDocument: { id: string } }).didDocument.id === didA0,
-    'self-selected body must carry A key0 didDocument',
-  )
+  const didRegistersBeforeVerify = didRegisters.length
+  const emailSendsBeforeVerify = emailSends.length
+  const localMatch = `ve-${stamp}`
+  const fullMatch = `${localMatch}.awiki.ai`
+  const candidateB = buildAwikiIdentity(fullMatch, seedB, 'awiki.ai')
+  lookupMode = 'match'
+  lookupDid = candidateB.did
+  const verifiedB = await bg<Resp<{ did: string; fullHandle: string }>>({
+    type: 'anp-wallet/verify-existing',
+    walletId: walletBId,
+    handle: localMatch,
+  })
+  eq(verifiedB.status, 'ok', 'verify-existing success')
+  eq(verifiedB.did, candidateB.did, 'verified DID matches the imported key')
+  eq(verifiedB.fullHandle, fullMatch, 'verified full handle')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  walletB = walletFrom(st, walletBId)
+  eq(walletB.registered, true, 'wallet marked registered after verify')
+  eq(walletB.handle, fullMatch, 'wallet handle after verify')
+  eq(walletB.keys[0].registered, true, 'primary key registered')
+  eq(walletB.keys[0].did, candidateB.did, 'DID re-minted with the handle')
+  eq(walletB.activeKeyIndex, 0, 'verified wallet activates its primary')
+  eq(didRegisters.length, didRegistersBeforeVerify, 'verify-existing must not call register')
+  eq(emailSends.length, emailSendsBeforeVerify, 'verify-existing must not send email')
+  const verifiedBDid = verifiedB.did
 
-  // =========================================================================
-  // SCENARIO 4 — register a key on a NON-active wallet. Proves the register
-  // handler derives from the target wallet's mnemonic and switches active there.
-  // =========================================================================
-  const addKeyA2 = (await bg({ type: 'anp-wallet/add-key', walletId: walletAId })) as Resp<{ keyIndex: number }>
-  assert(addKeyA2.status === 'ok' && addKeyA2.keyIndex === 1, 'add-key A for register failed')
-  const stamp = Date.now().toString(36).slice(-6)
-  // Bug #2: register now submits with the wallet's PRIMARY key (no keyIndex param).
-  const reg = (await bg({
-    type: 'anp-wallet/register',
-    walletId: walletAId,
-    handle: `bg-${stamp}`,
-  })) as Resp<{ did: string; dids: string[] }>
-  console.log('register (non-active A):', reg.status, reg.did ?? reg.error ?? '')
-  assert(reg.status === 'ok', 'register on non-active wallet failed: ' + (reg.error ?? ''))
-  assert(reg.did === didA0, `register must submit with the PRIMARY key (got ${reg.did}, expected ${didA0})`)
-  assert(Array.isArray(reg.dids) && reg.dids.length === 2, 'register should return all DIDs under the handle')
-  assert(reg.dids.includes(reg.did), 'register dids should include the submitting DID')
-  const stReg = (await bg({ type: 'anp-wallet/get-state' })) as State
-  assert(stReg.account.activeWalletId === walletAId, 'register should switch active to the registered wallet')
-  assert(stReg.activeRef?.keyIndex === 0, 'register should set the PRIMARY key active')
-  const wAreg = stReg.account.wallets.find((w) => w.id === walletAId)!
-  assert(wAreg.primaryKeyIndex === 0, 'primary should remain key 0')
-  // Aggregate model: one handle = ONE ad.json listing every key → all keys become
-  // registered, and the wallet flips to handle-level `registered`.
-  assert(wAreg.registered === true, 'register should write back wallet-level registered=true')
-  assert(wAreg.keys.every((k) => k.registered === true), 'aggregate registration should mark every key registered')
-  assert(wAreg.keys.every((k) => k.handle === `bg-${stamp}.localhost`), 'aggregate registration should write back handle to every key')
-  const idelReg = (await bg({ type: 'anp-wallet/get-identity' })) as { did: string }
-  assert(idelReg.did === reg.did, 'get-identity should return the newly registered DID')
-
-  // =========================================================================
-  // SCENARIO 4b — set-primary on a registered wallet re-binds ownership on the
-  // server (member takeover) and lets the OLD primary be deleted afterward.
-  // =========================================================================
-  const setPri = (await bg({ type: 'anp-wallet/set-primary', walletId: walletAId, keyIndex: 1 })) as Resp
-  console.log('set-primary A:', setPri.status, setPri.error ?? '')
-  assert(setPri.status === 'ok', 'set-primary failed: ' + (setPri.error ?? ''))
-  const stPri = (await bg({ type: 'anp-wallet/get-state' })) as State
-  const wApri = stPri.account.wallets.find((w) => w.id === walletAId)!
-  assert(wApri.primaryKeyIndex === 1, 'set-primary should move primary to key1')
-  assert(wApri.registered === true, 'set-primary on a registered wallet should keep it registered')
-
-  // Deleting the CURRENT primary (key1, while 2 keys still exist) is blocked.
-  const delCurPri = (await bg({ type: 'anp-wallet/delete-key', walletId: walletAId, keyIndex: 1 })) as Resp
-  assert(delCurPri.status === 'error' && delCurPri.error === '主密钥不能删除', 'current primary must not be deletable')
-
-  // Deleting the OLD primary (key0, array pos 0) is now allowed.
-  const delOldPri = (await bg({ type: 'anp-wallet/delete-key', walletId: walletAId, keyIndex: 0 })) as Resp
-  assert(delOldPri.status === 'ok', 'deleting the old primary after a change should succeed')
-  const stDelPri = (await bg({ type: 'anp-wallet/get-state' })) as State
-  const wAdel = stDelPri.account.wallets.find((w) => w.id === walletAId)!
-  assert(wAdel.keys.length === 1, 'should have 1 key after deleting the old primary')
-  // key1 shifts to array pos 0; primary preindexes down to 0.
-  assert(wAdel.primaryKeyIndex === 0, 'primary should reindex after a key before it is deleted')
-
-  // =========================================================================
-  // SCENARIO 5 — delete-wallet + rename + handle-less wallet + active fallback.
-  // =========================================================================
-  // Delete the NOT-active wallet → ok, active stays A.
-  const delWb = (await bg({ type: 'anp-wallet/delete-wallet', walletId: walletBId })) as Resp
-  assert(delWb.status === 'ok', 'delete-wallet B failed')
-  const stDel = (await bg({ type: 'anp-wallet/get-state' })) as State
-  assert(stDel.account.wallets.length === 1, 'should have 1 wallet after deleting B')
-  assert(stDel.account.activeWalletId === walletAId, 'active should stay A after deleting non-active B')
-
-  // Wallet labels are editable (Bug: 「钱包 1」was not renamable).
-  const rename = (await bg({ type: 'anp-wallet/rename-wallet', walletId: walletAId, label: '主工作钱包' })) as Resp
-  assert(rename.status === 'ok', 'rename-wallet failed')
-  const stRen = (await bg({ type: 'anp-wallet/get-state' })) as State
-  assert(stRen.account.wallets.find((w) => w.id === walletAId)?.label === '主工作钱包', 'wallet label should update after rename')
-
-  // A wallet added WITHOUT a handle still owns its key0 (Bug: 「钱包 1」had no key0).
-  const addNoHandle = (await bg({ type: 'anp-wallet/add-wallet', mnemonic: generateMnemonicPhrase(256) })) as Resp<{ walletId: string; keyIndex: number }>
-  assert(addNoHandle.status === 'ok', 'add-wallet (no handle) failed')
-  const stNH = (await bg({ type: 'anp-wallet/get-state' })) as State
-  const nhWallet = stNH.account.wallets.find((w) => w.id === addNoHandle.walletId)!
-  assert(nhWallet.keys.length === 1, 'a handle-less wallet must still have its key0')
-  assert(addNoHandle.keyIndex === 0, 'handle-less wallet active key index should be 0')
-
-  // Delete the ACTIVE (handle-less) wallet → falls back to remaining wallet[0] (A).
-  const delActive = (await bg({ type: 'anp-wallet/delete-wallet', walletId: addNoHandle.walletId })) as Resp
-  console.log('delete active wallet:', delActive.status, 'fallback active=', (stNH.activeRef?.walletId ?? '') || '(recompute)')
-  assert(delActive.status === 'ok', 'delete-wallet active (no-handle) failed')
-  const stFall = (await bg({ type: 'anp-wallet/get-state' })) as State
-  assert(stFall.account.wallets.length === 1, 'should have 1 wallet after deleting active no-handle wallet')
-  if (stFall.activeRef) assert(stFall.activeRef.walletId === walletAId, 'active should fall back to A')
-
-  // =========================================================================
-  // Optional: real-server login through the built background.
-  // =========================================================================
-  const BASE = process.env.AGWORLD_URL ?? 'http://localhost:3000'
-  try {
-    const { nonce: serverNonce } = await fetch(`${BASE}/api/login/anp/nonce`).then((r) => r.json())
-    const realBody = JSON.stringify({ nonce: serverNonce, didDocument: idelB2.didDocument })
-    const ack = (await bg({ type: 'anp-wallet/sign', payload: { id: 'req-2', req: { url: `${BASE}/api/login/anp/verify`, method: 'POST', body: realBody, nonce: serverNonce } } })) as Resp
-    assert(ack.status === 'pending', 'sign staged for server login')
-    await bg({ type: 'anp-wallet/approve', id: 'req-2' })
-    const delivered2 = tabMessages.find((m) => m.id === 'req-2')!
-    const headers = (delivered2.result as { headers: Record<string, string> }).headers
-    const res = await fetch(`${BASE}/api/login/anp/verify`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...headers },
-      body: (delivered2.result as { body: string }).body,
+  async function addImported(seed: Uint8Array, label: string): Promise<string> {
+    const added = await bg<Resp<{ walletId: string }>>({
+      type: 'anp-wallet/add-wallet',
+      source: 'imported',
+      privateKey: seedHex(seed),
+      label,
     })
-    const data = (await res.json().catch(() => ({}))) as { token?: string }
-    console.log('server login (via built bg):', res.status, 'token present:', Boolean(data.token))
-  } catch (e) {
-    console.log('server e2e skipped/failed:', (e as Error).message)
+    eq(added.status, 'ok', `add imported wallet ${label}`)
+    return added.walletId
   }
 
-  // =========================================================================
-  // SCENARIO 6 — the LAST wallet is deletable (Bug: everything must be deletable).
-  // =========================================================================
-  const delLast = (await bg({ type: 'anp-wallet/delete-wallet', walletId: walletAId })) as Resp
-  assert(delLast.status === 'ok', 'deleting the last wallet should succeed')
-  const stZero = (await bg({ type: 'anp-wallet/get-state' })) as State
-  assert(stZero.account !== null && stZero.account.wallets.length === 0, 'should have 0 wallets after deleting the last one')
-  assert(stZero.account.activeWalletId === null, 'activeWalletId should be null with 0 wallets')
+  const mismatchWallet = await addImported(testSeed(4), 'Mismatch')
+  lookupMode = 'mismatch'
+  const verifyMismatch = await bg<Resp>({
+    type: 'anp-wallet/verify-existing',
+    walletId: mismatchWallet,
+    handle: `mm-${stamp}`,
+  })
+  eq(verifyMismatch.status, 'error', 'verify-existing rejects mismatched DID')
+  assert(must(verifyMismatch.error, 'mismatch verify error').includes('不匹配'), 'mismatch verify message')
 
-  console.log('RESULT: PASS ✅ (v4 multi-wallet: migration + wallet/key mgmt + primary-key model + register-by-primary + set-primary re-register + delete-primary-block + wallet-owned login body + editable labels + handle-less key0 + deletable last wallet)')
+  const missingWallet = await addImported(testSeed(5), 'Missing')
+  lookupMode = 'missing'
+  const verifyMissing = await bg<Resp>({
+    type: 'anp-wallet/verify-existing',
+    walletId: missingWallet,
+    handle: `nf-${stamp}`,
+  })
+  eq(verifyMissing.status, 'error', 'verify-existing handles missing handle')
+  assert(must(verifyMissing.error, 'missing verify error').includes('未注册'), 'missing verify message')
+
+  const unsupportedWallet = await addImported(testSeed(6), 'Unsupported')
+  lookupMode = 'unsupported'
+  const verifyUnsupported = await bg<Resp>({
+    type: 'anp-wallet/verify-existing',
+    walletId: unsupportedWallet,
+    handle: `us-${stamp}`,
+  })
+  eq(verifyUnsupported.status, 'error', 'verify-existing handles unsupported lookup')
+  assert(
+    must(verifyUnsupported.error, 'unsupported verify error').includes('不支持 handle 查询'),
+    'unsupported verify message',
+  )
+  eq(didRegisters.length, didRegistersBeforeVerify, 'failed verifications never register')
+  eq(emailSends.length, emailSendsBeforeVerify, 'failed verifications never email')
+
+  const seedH = testSeed(7)
+  const walletHId = await addImported(seedH, 'Rebind')
+  console.log('verify-existing: ok')
+
+  // =========================================================================
+  // 7. Email verification + did_document registration (awiki).
+  // =========================================================================
+  const handleA = `mn-${stamp}`
+  const fullHandleA = `${handleA}.awiki.ai`
+  const emailA = 'Tester@Example.COM'
+  const emailKey = `tester@example.com|${fullHandleA}`
+  emailVerified.delete(emailKey)
+
+  const statusBefore = await bg<Resp<{ verified: boolean }>>({
+    type: 'anp-wallet/email-status',
+    serverId: 'awiki.ai',
+    email: emailA,
+    fullHandle: fullHandleA,
+  })
+  eq(statusBefore.status, 'ok', 'email-status before verification')
+  eq(statusBefore.verified, false, 'email starts unverified')
+  assertVersionHeader(calls[calls.length - 1], 'email-status')
+
+  const send = await bg<Resp<{ message: string }>>({
+    type: 'anp-wallet/email-send',
+    serverId: 'awiki.ai',
+    email: emailA,
+    fullHandle: fullHandleA,
+  })
+  eq(send.status, 'ok', 'email-send')
+  eq(emailSends.length, 1, 'email-send recorded')
+  eq(emailSends[0].body.email, 'tester@example.com', 'email normalized before send')
+  eq(emailSends[0].body.handle, fullHandleA, 'email send uses full handle')
+  assertVersionHeader(emailSends[0], 'email-send')
+
+  emailVerified.add(emailKey)
+  const statusAfter = await bg<Resp<{ verified: boolean }>>({
+    type: 'anp-wallet/email-status',
+    serverId: 'awiki.ai',
+    email: emailA,
+    fullHandle: fullHandleA,
+  })
+  eq(statusAfter.status, 'ok', 'email-status after verification')
+  eq(statusAfter.verified, true, 'email verified after activation')
+
+  const regA = await bg<Resp<{ did: string; fullHandle: string; mode: string }>>({
+    type: 'anp-wallet/register',
+    walletId: walletAId,
+    handle: handleA,
+    email: emailA,
+  })
+  eq(regA.status, 'ok', 'register mnemonic wallet on awiki')
+  eq(regA.mode, 'did_document', 'register mode did_document')
+  eq(regA.fullHandle, fullHandleA, 'registered full handle')
+  eq(didRegisters.length, 1, 'one did_document registration captured')
+  const regCall = didRegisters[0]
+  assertVersionHeader(regCall, 'register')
+  eq(regCall.host, 'awiki.ai', 'register sent to awiki')
+  assert(!!regCall.body.params.did_document, 'register params include did_document')
+  eq(regCall.body.params.email, 'tester@example.com', 'register email normalized')
+  eq(regCall.body.params.handle, handleA, 'register handle is local part')
+  assert(!('ad' in regCall.body.params), 'did_document register has no aggregate ad')
+  assert(!('challenge' in regCall.body.params), 'did_document register has no challenge')
+  eq(regCall.body.params.did_document.id, regA.did, 'submitted document DID matches response')
+
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  walletA = walletFrom(st, walletAId)
+  eq(walletA.registered, true, 'wallet A registered')
+  eq(walletA.keys.length, 2, 'wallet A keeps its two keys')
+  eq(walletA.keys.filter((k) => k.registered).length, 1, 'only the primary key registered')
+  eq(walletA.keys[walletA.primaryKeyIndex].registered, true, 'primary key registered')
+  eq(walletA.keys.filter((k) => !k.registered).length, 1, 'second key unregistered')
+  eq(walletA.handle, fullHandleA, 'wallet handle written back')
+  eq(walletA.activeKeyIndex, walletA.primaryKeyIndex, 'active key is primary after register')
+  eq(walletA.didDomain, 'awiki.ai', 'registered wallet domain')
+  const didLocal = regA.did.split(':')[4]
+  eq(didLocal, handleA, 'DID local-part equals the handle')
+
+  const docA = must(walletA.handleDocuments, 'wallet A stored DID document')
+  eq(docA.id, regA.did, 'stored document id')
+  const vmA = docA.verificationMethod as unknown[]
+  eq(vmA.length, 1, 'DID document has one identity verification method')
+  assert(!('keyAgreement' in docA), 'identity-only document has no keyAgreement')
+  eqJson(serviceIn(docA), expectedService(MOCK_SERVICE, regA.did), 'submitted service is verbatim')
+  const proofA = docA.proof as Record<string, unknown>
+  eq(proofA.type, 'DataIntegrityProof', 'proof type')
+  eq(proofA.cryptosuite, 'eddsa-jcs-2022', 'proof cryptosuite')
+  eq(proofA.domain, 'awiki.ai', 'proof domain')
+  assert(String(proofA.proofValue).startsWith('z'), 'proofValue is base58 multibase')
+
+  const jsonAfterReg = rawJson()
+  assert(!jsonAfterReg.includes('tester@example.com'), 'account must not persist the email')
+  assert(!jsonAfterReg.includes('secret-token'), 'account must not persist access_token')
+  assert(!jsonAfterReg.includes('accessToken'), 'account must not have accessToken field')
+  console.log('did_document register + email: ok')
+
+  // =========================================================================
+  // 8. Post-registration key rules + signing (mnemonic + imported self-select).
+  // =========================================================================
+  const addKeyA2 = await bg<Resp<{ keyIndex: number }>>({ type: 'anp-wallet/add-key', walletId: walletAId })
+  eq(addKeyA2.status, 'ok', 'add key after did_document registration')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  walletA = walletFrom(st, walletAId)
+  eq(walletA.keys.length, 3, 'wallet A now has three keys')
+  eq(walletA.registered, true, 'wallet stays registered after add-key')
+  eq(walletA.keys.filter((k) => k.registered).length, 1, 'new key stays unregistered')
+
+  const setPrimaryRegistered = await bg<Resp>({
+    type: 'anp-wallet/set-primary',
+    walletId: walletAId,
+    keyIndex: 2,
+  })
+  eq(setPrimaryRegistered.status, 'error', 'registered did_document wallet rejects set-primary')
+  assert(
+    must(setPrimaryRegistered.error, 'set-primary error').includes('不能更换主密钥'),
+    'set-primary rejection message',
+  )
+
+  await bg({ type: 'anp-wallet/lock' })
+  const identityLocked = await bg<{ did: string; didDocument: Record<string, unknown> }>({
+    type: 'anp-wallet/get-identity',
+  })
+  eq(identityLocked.did, regA.did, 'get-identity works while locked')
+
+  const body = JSON.stringify({ nonce, didDocument: {} })
+  const signAck = await bg<Resp<{ id: string }>>({
+    type: 'anp-wallet/sign',
+    payload: { id: 'req-1', req: { url: TARGET, method: 'POST', body, nonce } },
+  })
+  eq(signAck.status, 'pending', 'sign stages while locked')
+  assert(openPopupCalls > 0, 'sign opens popup')
+
+  const unlockA = await bg<Resp>({ type: 'anp-wallet/unlock', password })
+  eq(unlockA.status, 'ok', 'unlock mnemonic wallet')
+  const approveA = await bg<Resp<{ did: string; body: string }>>({ type: 'anp-wallet/approve', id: 'req-1' })
+  eq(approveA.status, 'ok', 'approve mnemonic signature')
+  const deliveredA = must(tabMessages.find((m) => m.id === 'req-1'), 'delivered mnemonic signature')
+  eq((deliveredA.result as { did: string }).did, regA.did, 'mnemonic signature uses registered DID')
+  const bodyA = JSON.parse((deliveredA.result as { body: string }).body)
+  eq(bodyA.didDocument.id, regA.did, 'delivered body carries the signing DID document')
+
+  const signSel = await bg<Resp<{ id: string }>>({
+    type: 'anp-wallet/sign',
+    payload: { id: 'req-sel', req: { url: TARGET, method: 'POST', body, nonce } },
+  })
+  eq(signSel.status, 'pending', 'sign stages for self-select')
+  const approveSel = await bg<Resp>({
+    type: 'anp-wallet/approve',
+    id: 'req-sel',
+    sel: { walletId: walletBId, keyIndex: 0 },
+  })
+  eq(approveSel.status, 'ok', 'approve imported key self-select')
+  const deliveredSel = must(tabMessages.find((m) => m.id === 'req-sel'), 'delivered self-selected signature')
+  eq((deliveredSel.result as { did: string }).did, verifiedBDid, 'self-selected signature uses imported key DID')
+  assert(
+    (deliveredSel.result as { didDocument: { id: string } }).didDocument.id === verifiedBDid,
+    'self-selected body is re-written for the imported key',
+  )
+  console.log('signing (mnemonic + imported): ok')
+
+  // =========================================================================
+  // 9. Custom server: rebind, unsupported email, did_document registration.
+  // =========================================================================
+  const setCustomDefault = await bg<Resp>({ type: 'anp-wallet/set-default-server', serverId: customServerId })
+  eq(setCustomDefault.status, 'ok', 'custom server becomes default')
+
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  const hBefore = walletFrom(st, walletHId)
+  const hPubBefore = hBefore.keys[0].publicKeyMultibase
+  const hDidBefore = hBefore.keys[0].did
+  const rebindH = await bg<Resp>({ type: 'anp-wallet/rebind-server', walletId: walletHId, serverId: customServerId })
+  eq(rebindH.status, 'ok', 'rebind unregistered wallet to custom server')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  const hAfter = walletFrom(st, walletHId)
+  eq(hAfter.serverId, customServerId, 'rebound wallet server')
+  eq(hAfter.didDomain, 'reg.example.test', 'rebound wallet DID domain')
+  eq(hAfter.keys[0].publicKeyMultibase, hPubBefore, 'rebind keeps the public key')
+  assert(hAfter.keys[0].did !== hDidBefore, 'rebind changes the DID')
+  eq(hAfter.handle, '', 'rebind clears the handle')
+  eq(hAfter.registered, false, 'rebound wallet is unregistered')
+
+  const rebindRegistered = await bg<Resp>({
+    type: 'anp-wallet/rebind-server',
+    walletId: walletAId,
+    serverId: customServerId,
+  })
+  eq(rebindRegistered.status, 'error', 'registered wallet cannot rebind')
+  assert(must(rebindRegistered.error, 'rebind error').includes('已注册'), 'rebind rejection message')
+
+  const handleH = `cu-${stamp}`
+  const fullHandleH = `${handleH}.reg.example.test`
+  const emailCustom = await bg<Resp>({
+    type: 'anp-wallet/email-status',
+    serverId: customServerId,
+    email: 'tester@example.com',
+    fullHandle: fullHandleH,
+  })
+  eq(emailCustom.status, 'unsupported', 'custom server without email verification reports unsupported')
+
+  const regH = await bg<Resp<{ did: string; fullHandle: string; mode: string }>>({
+    type: 'anp-wallet/register',
+    walletId: walletHId,
+    handle: handleH,
+    email: 'tester@example.com',
+  })
+  eq(regH.status, 'ok', 'register on custom server')
+  eq(regH.mode, 'did_document', 'custom registration still uses did_document')
+  eq(regH.fullHandle, fullHandleH, 'custom full handle')
+  eq(didRegisters.length, 2, 'custom registration captured')
+  const regHCall = didRegisters[1]
+  assertVersionHeader(regHCall, 'custom register')
+  eq(regHCall.host, 'reg.example.test', 'custom register host')
+  eq(regHCall.body.params.handle, handleH, 'custom register local handle')
+  assert(!!regHCall.body.params.did_document, 'custom register sends did_document')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  const hReg = walletFrom(st, walletHId)
+  eq(hReg.registered, true, 'custom wallet registered')
+  eq(hReg.didDomain, 'reg.example.test', 'custom wallet domain preserved')
+  eq(hReg.keys[0].did.split(':')[2], 'reg.example.test', 'custom DID domain')
+  eqJson(
+    serviceIn(must(hReg.handleDocuments, 'custom DID document')),
+    expectedService(serviceFor('reg.example.test'), regH.did),
+    'custom service descriptor is verbatim',
+  )
+  console.log('custom server rebind + register: ok')
+
+  // =========================================================================
+  // 10. DID-domain mismatch guards.
+  // =========================================================================
+  const addWrong2 = await bg<Resp<{ server: ServerLike }>>({
+    type: 'anp-wallet/add-server',
+    rpcBase: 'https://wrong.example.test',
+    didDomain: 'wrong.example.test',
+  })
+  const wrong2 = must(addWrong2.server, 'wrong server 2')
+  await bg({ type: 'anp-wallet/set-default-server', serverId: wrong2.id })
+  const walletWrongId = await addImported(testSeed(8), 'WrongDomain')
+  const rawW = rawAccount()
+  const walletWrong = must(rawW.wallets.find((w) => w.id === walletWrongId), 'wrong wallet in storage')
+  walletWrong.didDomain = 'awiki.ai'
+  store.set('anp_account', rawW)
+  const regWrong = await bg<Resp>({
+    type: 'anp-wallet/register',
+    walletId: walletWrongId,
+    handle: `wr-${stamp}`,
+    email: 'tester@example.com',
+  })
+  eq(regWrong.status, 'error', 'wallet/server domain mismatch rejected')
+  assert(must(regWrong.error, 'wallet mismatch error').includes('不一致'), 'wallet mismatch message')
+  eq(didRegisters.length, 2, 'mismatched wallet never reaches register')
+  await bg({ type: 'anp-wallet/delete-wallet', walletId: walletWrongId })
+
+  const addMismatch2 = await bg<Resp<{ server: ServerLike }>>({
+    type: 'anp-wallet/add-server',
+    rpcBase: 'https://mismatch.example.test',
+    didDomain: 'mismatch.example.test',
+  })
+  const mismatch2 = must(addMismatch2.server, 'mismatch server 2')
+  await bg({ type: 'anp-wallet/set-default-server', serverId: mismatch2.id })
+  const walletMismatchId = await addImported(testSeed(9), 'DiscoveryMismatch')
+  const regMismatch = await bg<Resp>({
+    type: 'anp-wallet/register',
+    walletId: walletMismatchId,
+    handle: `dm-${stamp}`,
+    email: 'tester@example.com',
+  })
+  eq(regMismatch.status, 'error', 'discovered domain mismatch rejected')
+  assert(must(regMismatch.error, 'mismatch error').includes('不一致'), 'discovery mismatch message')
+  eq(didRegisters.length, 2, 'domain mismatch never reaches register')
+  await bg({ type: 'anp-wallet/delete-wallet', walletId: walletMismatchId })
+  await bg({ type: 'anp-wallet/set-default-server', serverId: 'awiki.ai' })
+  await bg({ type: 'anp-wallet/remove-server', serverId: wrong2.id })
+  await bg({ type: 'anp-wallet/remove-server', serverId: mismatch2.id })
+  console.log('domain mismatch guards: ok')
+
+  // =========================================================================
+  // 11. Legacy aggregate compatibility: ad + challenge, re-submit on set-primary.
+  // =========================================================================
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  const walletABeforeAggregate = walletFrom(st, walletAId)
+  eq(walletABeforeAggregate.keys.length, 3, 'aggregate clone source has three keys')
+  await bg({ type: 'anp-wallet/lock' })
+
+  const aggregateWallet = structuredClone(walletABeforeAggregate)
+  aggregateWallet.id = `agg-${stamp}`
+  aggregateWallet.label = 'Aggregate'
+  aggregateWallet.handle = ''
+  aggregateWallet.registered = false
+  delete aggregateWallet.handleDocuments
+  aggregateWallet.serverId = null
+  aggregateWallet.didDomain = 'localhost'
+  aggregateWallet.registerMode = 'aggregate'
+  aggregateWallet.activeKeyIndex = 0
+  aggregateWallet.primaryKeyIndex = 0
+  aggregateWallet.nextKeyIndex = 3
+  store.set('anp_account', {
+    version: 5,
+    wallets: [aggregateWallet],
+    activeWalletId: aggregateWallet.id,
+  } satisfies AccountLike)
+
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  const aggLoaded = walletFrom(st, aggregateWallet.id)
+  eq(aggLoaded.registerMode, 'aggregate', 'v5 aggregate mode survives normalization')
+  const unlockAgg = await bg<Resp>({ type: 'anp-wallet/unlock', password })
+  eq(unlockAgg.status, 'ok', 'unlock aggregate wallet from cloned mnemonic blob')
+
+  const handleAgg = `ag-${stamp}`
+  const fullHandleAgg = `${handleAgg}.localhost`
+  const regAgg = await bg<Resp<{ did: string; dids: string[]; mode: string }>>({
+    type: 'anp-wallet/register',
+    walletId: aggregateWallet.id,
+    handle: handleAgg,
+  })
+  eq(regAgg.status, 'ok', 'register legacy aggregate wallet')
+  eq(regAgg.mode, 'aggregate', 'aggregate mode response')
+  eq(regAgg.dids.length, 3, 'aggregate response lists all DIDs')
+  eq(aggregateRegisters.length, 1, 'one aggregate registration captured')
+  const aggCall = aggregateRegisters[0]
+  assertVersionHeader(aggCall, 'aggregate register')
+  eq(aggCall.host, '127.0.0.1', 'aggregate register uses legacy localhost server')
+  assert(!!aggCall.body.params.ad, 'aggregate params include ad')
+  assert(!!aggCall.body.params.challenge, 'aggregate params include challenge')
+  assert(!!aggCall.body.params.challenge_signature, 'aggregate params include challenge_signature')
+  eq(aggCall.body.params.submitting_did, regAgg.did, 'aggregate submitting DID is the primary')
+  assert(!('did_document' in aggCall.body.params), 'aggregate does not send did_document')
+  assert(!('email' in aggCall.body.params), 'aggregate register omits empty email')
+  const challengeCalls = calls.filter((c) => c.host === '127.0.0.1' && c.body?.method === 'challenge')
+  eq(challengeCalls.length, 1, 'aggregate fetches a challenge')
+  assertVersionHeader(challengeCalls[0], 'aggregate challenge')
+  const ad = aggCall.body.params.ad as Record<string, unknown>
+  eq(ad.type, 'ANPHandleAggregate', 'aggregate document type')
+  eq(ad.handle, fullHandleAgg, 'aggregate handle')
+  eq((ad.dids as string[]).length, 3, 'aggregate document lists every key DID')
+  eq((ad.verificationMethod as unknown[]).length, 3, 'aggregate document lists every key')
+  assert(!('keyAgreement' in ad), 'aggregate document has no keyAgreement')
+  assert(String((ad.proof as Record<string, unknown>).proofValue).startsWith('z'), 'aggregate proof is base58')
+
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  let agg = walletFrom(st, aggregateWallet.id)
+  eq(agg.registered, true, 'aggregate wallet registered')
+  eq(agg.keys.every((k) => k.registered === true), true, 'aggregate marks every key registered')
+  eq(agg.handle, fullHandleAgg, 'aggregate wallet handle')
+  eq(agg.activeKeyIndex, 0, 'aggregate primary active')
+
+  const aggKey1Did = agg.keys[1].did
+  const setPrimaryAgg = await bg<Resp>({ type: 'anp-wallet/set-primary', walletId: agg.id, keyIndex: 1 })
+  eq(setPrimaryAgg.status, 'ok', 'aggregate set-primary re-registers')
+  eq(aggregateRegisters.length, 2, 'set-primary submits the aggregate again')
+  eq(
+    aggregateRegisters[1].body.params.submitting_did,
+    aggKey1Did,
+    're-submitted aggregate uses the new primary as submitting DID',
+  )
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  agg = walletFrom(st, aggregateWallet.id)
+  eq(agg.primaryKeyIndex, 1, 'aggregate primary moved')
+  eq(agg.keys.every((k) => k.registered === true), true, 're-registration keeps every key registered')
+
+  const aggAddKey = await bg<Resp<{ keyIndex: number }>>({ type: 'anp-wallet/add-key', walletId: agg.id })
+  eq(aggAddKey.status, 'ok', 'aggregate add-key')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  agg = walletFrom(st, aggregateWallet.id)
+  eq(agg.keys.length, 4, 'aggregate gained a key')
+  eq(agg.registered, false, 'aggregate registration invalidated by add-key')
+  eq(agg.keys.every((k) => !k.registered), true, 'all aggregate keys unregistered after invalidation')
+  console.log('legacy aggregate: ok')
+
+  // =========================================================================
+  // 12. Global invariants: headers, identity-only, deletable last wallet.
+  // =========================================================================
+  const discoveryCalls = calls.filter((c) => c.path === '/.well-known/did.json')
+  assert(discoveryCalls.length >= 4, 'discovery was exercised')
+  for (const call of discoveryCalls) {
+    assert(!('x-awiki-client-version' in call.headers), 'discovery carries no client version header')
+  }
+  const userCalls = calls.filter((c) => c.path.startsWith('/user-service/v1/'))
+  assert(userCalls.length >= 8, 'user-service calls were exercised')
+  for (const call of userCalls) assertVersionHeader(call, `user-service ${call.path}`)
+
+  const finalJson = rawJson()
+  assert(!finalJson.includes('accessToken'), 'final account has no accessToken')
+  assert(!finalJson.includes('legacy-token'), 'final account has no aggregate access token')
+  assert(!finalJson.includes('keyAgreement'), 'final account has no keyAgreement')
+  assert(!finalJson.includes('X25519'), 'final account has no X25519 material')
+
+  const delLast = await bg<Resp>({ type: 'anp-wallet/delete-wallet', walletId: agg.id })
+  eq(delLast.status, 'ok', 'delete the last wallet')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  eq(stateAccount(st).wallets.length, 0, 'zero wallets remain')
+  eq(stateAccount(st).activeWalletId, null, 'active wallet cleared')
+  eq(st.unlocked, false, 'vault locks when the last wallet is deleted')
+
+  console.log(
+    'RESULT: PASS ✅ (v4→v5 migration, server registry, mnemonic+imported wallets, import parsing, verify-existing, email+did_document register, custom server rebind, domain guards, aggregate compat, signing, identity-only)',
+  )
 }
 
 main().catch((e) => {

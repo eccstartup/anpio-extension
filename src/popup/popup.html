@@ -13,49 +13,110 @@
     </header>
 
     <main>
-      <!-- ① 生成/导入助记词（首个钱包） -->
-      <section id="view-create" class="view hidden">
-        <h2>创建钱包</h2>
-        <p class="muted">生成或导入助记词，并设置本地加密密码。这是你的第一个钱包，之后可在设置里继续添加。</p>
-        <label class="field">
-          <span>助记词（24 词 / 256-bit 熵，由系统 CSPRNG 生成）</span>
-          <textarea id="mnemonic" rows="3" placeholder="abandon … about"></textarea>
-        </label>
-        <div class="row">
-          <button id="btn-generate">随机生成 24 词</button>
-        </div>
-        <label class="field">
-          <span>钱包密码（全局，加密所有钱包的助记词）</span>
-          <input id="wallet-password" type="password" autocomplete="new-password" />
-        </label>
-        <button id="btn-create" class="primary">创建并加密</button>
-        <div id="create-err" class="err"></div>
-      </section>
+      <!-- ① 创建 / 添加钱包：助记词生成+备份+复述，或导入助记词/私钥 -->
+      <section id="view-secret" class="view hidden">
+        <h2 id="secret-title">创建钱包</h2>
+        <p id="secret-intro" class="muted">
+          钱包只管理 Ed25519 身份密钥和 DID；不会生成或保存任何通信/E2EE 密钥。
+        </p>
+        <button id="btn-secret-cancel" class="link hidden">取消</button>
 
-      <!-- ①b 添加另一个钱包 -->
-      <section id="view-addwallet" class="view hidden">
-        <h2>添加钱包</h2>
-        <p class="muted">每个钱包是一把独立助记词，用上面的全局密码加密。可填 handle 来绑定首个身份。</p>
-        <label class="field">
-          <span>助记词（24 词）</span>
-          <textarea id="add-mnemonic" rows="3" placeholder="abandon … about"></textarea>
-        </label>
-        <div class="row">
-          <button id="btn-addwallet-generate">随机生成 24 词</button>
+        <div class="source-tabs" id="source-tabs">
+          <button class="tab active" data-source="generate">生成助记词</button>
+          <button class="tab" data-source="mnemonic">导入助记词</button>
+          <button class="tab" data-source="key">导入私钥</button>
         </div>
-        <label class="field">
-          <span>Handle（可选，只填名字，自动补 .localhost）</span>
-          <input id="add-handle" placeholder="work" spellcheck="false" />
-        </label>
-        <button id="btn-addwallet-add" class="primary">添加并加密</button>
-        <div id="addwallet-err" class="err"></div>
-        <button id="btn-addwallet-back" class="link">返回</button>
+
+        <div id="secret-step-source">
+          <div id="source-generate" class="source-panel">
+            <p class="muted">生成 24 个单词的 BIP39 助记词。任何拿到它的人都能控制身份，请离线备份。</p>
+            <button id="btn-generate">生成 24 词</button>
+            <div id="generate-box" class="hidden">
+              <textarea id="mnemonic-display" rows="3" readonly spellcheck="false"></textarea>
+              <div class="row">
+                <button id="btn-copy-mnemonic">复制到剪贴板</button>
+              </div>
+              <p id="copy-hint" class="hint"></p>
+              <p class="warn">不要截图、不要发给任何人。下一步需要按顺序复述 3 个随机单词。</p>
+              <button id="btn-generate-next" class="primary">我已完成备份，继续</button>
+            </div>
+          </div>
+
+          <div id="source-mnemonic" class="source-panel hidden">
+            <label class="field">
+              <span>BIP39 助记词（通常 24 词）</span>
+              <textarea id="import-mnemonic" rows="3" placeholder="abandon … about" spellcheck="false"></textarea>
+            </label>
+            <label class="check">
+              <input id="mnemonic-saved" type="checkbox" />
+              <span>我已妥善保存这组助记词</span>
+            </label>
+            <div id="mnemonic-err" class="err"></div>
+            <button id="btn-mnemonic-next" class="primary">下一步</button>
+          </div>
+
+          <div id="source-key" class="source-panel hidden">
+            <label class="field">
+              <span>Ed25519 身份私钥（32/64 字节；hex、base64、base58 或 JWK）</span>
+              <textarea
+                id="import-key"
+                rows="3"
+                placeholder="0x… / z… / {&quot;kty&quot;:&quot;OKP&quot;,…}"
+                spellcheck="false"
+              ></textarea>
+            </label>
+            <div id="key-preview" class="preview-box hidden"></div>
+            <p class="warn">
+              只接受 Ed25519 身份私钥。不要粘贴 X25519、通信或 E2EE 密钥；裸 32
+              字节无法自动区分曲线，请核对预览中的公钥。
+            </p>
+            <label class="check">
+              <input id="key-confirm" type="checkbox" />
+              <span>我确认这是 Ed25519 身份私钥，不是通信/E2EE 密钥，并已妥善保存。</span>
+            </label>
+            <div id="key-err" class="err"></div>
+            <button id="btn-key-next" class="primary">下一步</button>
+          </div>
+        </div>
+
+        <div id="secret-step-recall" class="hidden">
+          <p class="muted">请按顺序填写下面 3 个位置的单词（不区分大小写）。</p>
+          <div id="recall-fields"></div>
+          <div class="row">
+            <button id="btn-recall-back">返回查看助记词</button>
+            <button id="btn-recall-next" class="primary">验证并继续</button>
+          </div>
+          <div id="recall-err" class="err"></div>
+        </div>
+
+        <div id="secret-step-meta" class="hidden">
+          <label class="field">
+            <span id="secret-handle-label">Handle（可选，例如 alice）</span>
+            <input id="secret-handle" placeholder="alice" spellcheck="false" autocomplete="off" />
+          </label>
+          <div id="secret-full-handle" class="hint"></div>
+          <div id="secret-did-preview" class="preview-box hidden"></div>
+
+          <label class="field">
+            <span>钱包名称（可选）</span>
+            <input id="secret-label" placeholder="钱包" />
+          </label>
+
+          <label class="field" id="password-field">
+            <span>钱包密码（全局，至少 8 位；用于加密所有钱包）</span>
+            <input id="wallet-password" type="password" autocomplete="new-password" />
+          </label>
+
+          <button id="btn-secret-submit" class="primary">创建并加密</button>
+          <div id="secret-err" class="err"></div>
+          <button id="btn-secret-back" class="link hidden">返回</button>
+        </div>
       </section>
 
       <!-- ② 解锁 -->
       <section id="view-unlock" class="view hidden">
         <h2>解锁钱包</h2>
-        <p class="muted">助记词已加密保存在本地，输入全局钱包密码解锁。</p>
+        <p class="muted">密文保存在本地，输入全局钱包密码解锁。密码无法找回。</p>
         <label class="field">
           <span>钱包密码</span>
           <input id="unlock-password" type="password" autocomplete="current-password" />
@@ -66,29 +127,75 @@
 
       <!-- ③ 注册 DID -->
       <section id="view-register" class="view hidden">
+        <button id="btn-register-back" class="link">← 返回钱包</button>
         <h2>注册身份</h2>
-        <p class="muted">用这个钱包的主密钥签名，把 handle 下所有密钥聚合注册，无需短信/邮箱验证。</p>
+        <div id="reg-summary" class="info-box"></div>
 
-        <div class="field">
-          <span>主密钥</span>
-          <div id="reg-primary-did" class="muted mono"></div>
+        <div id="reg-done" class="info-box hidden">
+          <div class="ok-line">✓ 已注册</div>
+          <dl>
+            <dt>Handle</dt>
+            <dd id="reg-done-handle" class="mono"></dd>
+            <dt>DID</dt>
+            <dd id="reg-done-did" class="mono"></dd>
+            <dt>模式</dt>
+            <dd id="reg-done-mode"></dd>
+          </dl>
         </div>
 
-        <label class="field">
-          <span>Handle（只填名字，自动补 .localhost，例如 alice）</span>
-          <input id="reg-handle" placeholder="alice" spellcheck="false" />
-        </label>
+        <div id="reg-form">
+          <div id="reg-rebind-box" class="hidden">
+            <p class="warn">
+              此钱包未绑定当前可用的注册服务器（旧 localhost 或服务器已移除）。未注册前可以更换服务器，私钥保持不变。
+            </p>
+            <label class="field">
+              <span>目标服务器</span>
+              <select id="reg-rebind-server"></select>
+            </label>
+            <button id="btn-rebind" class="primary">更换服务器</button>
+            <div id="rebind-err" class="err"></div>
+          </div>
 
-        <button id="btn-register" class="primary">注册</button>
-        <div id="reg-status" class="err"></div>
-        <button id="btn-register-back" class="link">返回</button>
+          <div id="reg-fields">
+            <p id="reg-note" class="hint"></p>
+            <label class="field">
+              <span>Handle（只填名字，自动补 DID 域名）</span>
+              <input id="reg-handle" placeholder="alice" spellcheck="false" autocomplete="off" />
+            </label>
+            <div id="reg-full-handle" class="hint"></div>
+
+            <div id="reg-email-field">
+              <label class="field">
+                <span>邮箱（仅用于本次注册，不会保存）</span>
+                <input id="reg-email" type="email" autocomplete="off" placeholder="you@example.com" />
+              </label>
+              <div id="reg-email-status" class="status-box hidden"></div>
+              <div class="row" id="reg-email-actions">
+                <button id="btn-email-send">发送验证邮件</button>
+                <button id="btn-email-check">检查验证状态</button>
+              </div>
+            </div>
+
+            <label class="field" id="reg-invite-field">
+              <span>邀请码（3–4 字符 handle 需要；可选）</span>
+              <input id="reg-invite" autocomplete="off" />
+            </label>
+
+            <button id="btn-register" class="primary" disabled>注册</button>
+            <div id="reg-status" class="err"></div>
+            <button id="btn-verify-existing" class="link">我已在服务器注册过这个 handle</button>
+          </div>
+        </div>
       </section>
 
-      <!-- ④ 主界面：钱包/handle 列表 -->
+      <!-- ④ 主界面：钱包列表 -->
       <section id="view-home" class="view hidden">
         <div id="home-head">
           <h2>钱包</h2>
-          <button id="btn-add-wallet" title="添加钱包">＋</button>
+          <div class="home-actions">
+            <button id="btn-servers" title="注册服务器">服务器</button>
+            <button id="btn-add-wallet" title="添加钱包">＋</button>
+          </div>
         </div>
         <ul id="wallet-list"></ul>
 
@@ -97,9 +204,10 @@
           <button id="btn-export">导出助记词</button>
         </div>
         <div id="export-box" class="hidden"></div>
+        <button id="btn-copy-export" class="link hidden">复制导出内容</button>
       </section>
 
-      <!-- ④b 钱包详情：handle + 密钥管理 -->
+      <!-- ④b 钱包详情 -->
       <section id="view-wallet" class="view hidden">
         <button id="btn-wallet-back" class="link">← 返回列表</button>
         <div id="wallet-head">
@@ -108,10 +216,11 @@
           <span id="wallet-primary" class="pill primary">主</span>
           <span id="wallet-pill" class="pill">0 密钥</span>
         </div>
+        <div id="wallet-badges" class="badges"></div>
         <div id="wallet-handle" class="muted"></div>
 
         <div class="row">
-          <button id="btn-wallet-register" class="primary">注册</button>
+          <button id="btn-wallet-register" class="primary">注册身份</button>
         </div>
 
         <ul id="key-list"></ul>
@@ -120,12 +229,50 @@
           <button id="btn-add-key" class="primary">＋ 添加密钥</button>
         </div>
 
+        <div id="add-key-form" class="hidden">
+          <label class="field">
+            <span>Ed25519 身份私钥（仅导入钱包）</span>
+            <textarea id="add-key-input" rows="3" placeholder="0x… / z… / JWK" spellcheck="false"></textarea>
+          </label>
+          <div id="add-key-err" class="err"></div>
+          <div class="row">
+            <button id="btn-add-key-submit" class="primary">导入私钥</button>
+            <button id="btn-add-key-cancel">取消</button>
+          </div>
+        </div>
+
         <div class="row">
           <button id="btn-wallet-delete" class="link">删除这个钱包</button>
         </div>
       </section>
 
-      <!-- ⑤ 签名确认 -->
+      <!-- ⑤ 注册服务器 -->
+      <section id="view-servers" class="view hidden">
+        <button id="btn-servers-back" class="link">← 返回</button>
+        <h2>注册服务器</h2>
+        <p class="muted">
+          新建钱包绑定默认服务器。自定义服务器必须支持 HTTPS、.well-known/did.json 与 user-service v1。
+        </p>
+        <ul id="server-list"></ul>
+
+        <h3>添加服务器</h3>
+        <label class="field">
+          <span>RPC 根 URL（仅 HTTPS）</span>
+          <input id="server-rpc" placeholder="https://example.com" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>DID 域名</span>
+          <input id="server-domain" placeholder="example.com" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>名称（可选）</span>
+          <input id="server-label" placeholder="我的服务器" />
+        </label>
+        <button id="btn-add-server" class="primary">保存并授权</button>
+        <div id="server-err" class="err"></div>
+      </section>
+
+      <!-- ⑥ 签名确认 -->
       <section id="view-sign" class="view hidden">
         <h2>签名请求确认</h2>
         <p class="muted">网站请求你用 ANP 身份签名登录：</p>
@@ -133,7 +280,7 @@
       </section>
     </main>
 
-    <footer>协议：ANP-03 · RFC 9421 · e1（Ed25519/Multikey）</footer>
+    <footer>身份-only · ANP-03 · RFC 9421 · Ed25519/Multikey</footer>
     <script src="popup.js"></script>
   </body>
 </html>

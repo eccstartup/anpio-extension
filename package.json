@@ -8,7 +8,8 @@
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
     "verify": "tsx scripts/verify-anp.ts",
-    "verify:bg": "tsx scripts/e2e-bg.ts"
+    "verify:bg": "tsx scripts/e2e-bg.ts",
+    "verify:did": "tsx scripts/verify-did-register.ts"
   },
   "dependencies": {
     "@noble/curves": "^1.4.0",
