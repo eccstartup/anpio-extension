@@ -105,7 +105,7 @@ function short(value: string, max = 54): string {
 
 /** The signing body exactly as sent; pretty-print JSON so it can be read in full. */
 function formatSignBody(body: string): string {
-  if (!body) return '（网站没有提交请求体；批准后会构造 nonce + did + didDocument）'
+  if (!body) return '（网站没有提交请求体，将按空 body 签名）'
   try {
     return JSON.stringify(JSON.parse(body), null, 2)
   } catch {
@@ -1537,7 +1537,7 @@ function renderSignList(state: State): void {
     const note = document.createElement('div')
     note.className = 'sign-note'
     note.textContent =
-      '批准后 did / didDocument 会替换为你所选身份的 DID 与公钥文档；签名覆盖上述完整 body（含 nonce）。'
+      '签名按网站提交的内容进行；若所选密钥与 body 里的 didDocument 不一致，会用所选身份的 DID 文档替换该字段。'
 
     const sel = document.createElement('select')
     sel.className = 'sign-key'

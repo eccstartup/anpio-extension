@@ -1133,7 +1133,6 @@ async function main() {
   const deliveredA = must(tabMessages.find((m) => m.id === 'req-1'), 'delivered mnemonic signature')
   eq((deliveredA.result as { did: string }).did, regA.did, 'mnemonic signature uses registered DID')
   const bodyA = JSON.parse((deliveredA.result as { body: string }).body)
-  eq(bodyA.did, regA.did, 'delivered body binds the signing DID')
   eq(bodyA.didDocument.id, regA.did, 'delivered body carries the signing DID document')
   // The inline document is the registered one, with its standard (folded) proof —
   // the wallet does not fork the cryptosuite to suit a relying party.
@@ -1154,8 +1153,8 @@ async function main() {
   await bg({ type: 'anp-wallet/reject', id: 'req-panel' })
   uiAcksPings = false
 
-  // A relying party may sign a request without a body; the wallet builds the
-  // ANP login body instead of signing empty bytes.
+  // A request without a site body is signed as empty bytes, not filled in by
+  // the wallet with fields the site never asked for.
   await bg<Resp<{ id: string }>>({
     type: 'anp-wallet/sign',
     payload: { id: 'req-empty', req: { url: TARGET, method: 'POST', body: '', nonce } },
@@ -1166,10 +1165,24 @@ async function main() {
     tabMessages.find((m) => m.id === 'req-empty'),
     'delivered empty-body signature',
   )
-  const bodyEmpty = JSON.parse((deliveredEmpty.result as { body: string }).body)
-  eq(bodyEmpty.nonce, nonce, 'constructed body carries the nonce')
-  eq(bodyEmpty.did, regA.did, 'constructed body carries the signing DID')
-  eq(bodyEmpty.didDocument.id, regA.did, 'constructed body carries the signing document')
+  eq((deliveredEmpty.result as { body: string }).body, '', 'empty site body is signed as-is')
+
+  // ANP-03 needs a server-issued nonce: without one the wallet refuses to sign
+  // rather than making one up.
+  const signNoNonce = await bg<Resp<{ id: string }>>({
+    type: 'anp-wallet/sign',
+    payload: { id: 'req-no-nonce', req: { url: TARGET, method: 'POST', body, nonce: '' } },
+  })
+  eq(signNoNonce.status, 'error', 'sign without a nonce is refused')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  assert(
+    !st.pending.some((p) => (p as { id: string }).id === 'req-no-nonce'),
+    'no pending request is staged without a nonce',
+  )
+  assert(
+    !tabMessages.some((m) => m.id === 'req-no-nonce'),
+    'nothing is delivered for a nonce-less request',
+  )
 
   const signSel = await bg<Resp<{ id: string }>>({
     type: 'anp-wallet/sign',
@@ -1189,7 +1202,6 @@ async function main() {
     'self-selected body is re-written for the imported key',
   )
   const selBody = JSON.parse((deliveredSel.result as { body: string }).body)
-  eq(selBody.did, verifiedBDid, 'self-selected body binds the imported DID')
   eq(selBody.didDocument.id, verifiedBDid, 'self-selected body document matches the imported DID')
   assertDocumentProof(selBody.didDocument)
   console.log('signing (mnemonic + imported): ok')

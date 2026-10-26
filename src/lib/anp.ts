@@ -789,6 +789,7 @@ export function signAnpLoginRequest(
   req: SignRequest,
 ): SignedRequest {
   const components = [...COVERED_COMPONENTS]
+  if (!req.nonce) throw new Error('ANP-03 signing requires a nonce')
   const method = req.method ?? 'POST'
   const now = Math.floor(Date.now() / 1000)
   const ttl = req.ttl ?? 300

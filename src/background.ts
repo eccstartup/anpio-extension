@@ -1045,6 +1045,11 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
   switch (msg.type) {
     case 'anp-wallet/sign': {
       const { id, req } = msg.payload
+      // ANP-03 requires a server-issued nonce; without one there is nothing
+      // legitimate to sign, and the wallet must not invent a substitute.
+      if (typeof req.nonce !== 'string' || !req.nonce.trim()) {
+        return { status: 'error', error: 'Missing nonce: refusing to sign without one.' }
+      }
       const account = await loadAccount()
       if (!account) {
         void openPopup()
@@ -1877,32 +1882,20 @@ async function approve(
   }
   if (!identity) return { status: 'error', error: '尚未注册 DID，请先在钱包里注册' }
 
-  // The site pre-builds the request body with the ACTIVE key's didDocument; if
-  // the user self-selected a DIFFERENT key, that document won't match the
-  // signer's keyid. Always bind the body to the signing identity. `did` is the
-  // field ANP login verifiers check against the keyid's DID; the connector
-  // omits it, so supply it from the identity we actually sign with. An empty
-  // body on a write method gets the ANP login body built for it.
+  // The site pre-builds the request body with the ACTIVE key's didDocument. If
+  // the user self-selected a DIFFERENT key to sign, that document would not
+  // match the signer's keyid, so replace just that field. Everything else —
+  // including a body the site left empty — is signed exactly as it was sent.
   let finalBody = item.req.body
-  const method = (item.req.method ?? 'POST').toUpperCase()
-  if (item.req.body.trim()) {
-    try {
-      const parsed: unknown = JSON.parse(item.req.body)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        const body = parsed as Record<string, unknown>
-        body.did = identity.did
-        body.didDocument = identity.didDocument
-        finalBody = JSON.stringify(body)
-      }
-    } catch {
-      /* non-JSON body — sign it as-is */
+  try {
+    const parsed: unknown = JSON.parse(item.req.body)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const body = parsed as Record<string, unknown>
+      body.didDocument = identity.didDocument
+      finalBody = JSON.stringify(body)
     }
-  } else if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
-    finalBody = JSON.stringify({
-      nonce: item.req.nonce,
-      did: identity.did,
-      didDocument: identity.didDocument,
-    })
+  } catch {
+    /* non-JSON body — sign it as-is */
   }
 
   try {
