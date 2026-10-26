@@ -103,6 +103,16 @@ function short(value: string, max = 54): string {
   return `${value.slice(0, max - 1)}…`
 }
 
+/** The signing body exactly as sent; pretty-print JSON so it can be read in full. */
+function formatSignBody(body: string): string {
+  if (!body) return '（空 body）'
+  try {
+    return JSON.stringify(JSON.parse(body), null, 2)
+  } catch {
+    return body
+  }
+}
+
 type ApiResponse = { status: string; [key: string]: unknown }
 
 function send<T = ApiResponse>(msg: BgRequest): Promise<T> {
@@ -1481,11 +1491,24 @@ function renderSignList(state: State): void {
 
     const meta = document.createElement('div')
     meta.className = 'sign-meta'
-    meta.textContent = `${p.method} ${short(p.url, 72)}`
+    meta.textContent = `${p.method} ${p.url}`
 
-    const preview = document.createElement('div')
+    const nonceLine = document.createElement('div')
+    nonceLine.className = 'sign-meta'
+    nonceLine.textContent = `nonce: ${p.nonce}`
+
+    const bodyLabel = document.createElement('div')
+    bodyLabel.className = 'sign-label'
+    bodyLabel.textContent = '待签名内容（网站提交的完整请求体）'
+
+    const preview = document.createElement('pre')
     preview.className = 'sign-body mono'
-    preview.textContent = short(p.bodyPreview || '（空 body）', 180)
+    preview.textContent = formatSignBody(p.body)
+
+    const note = document.createElement('div')
+    note.className = 'sign-note'
+    note.textContent =
+      '批准后 did / didDocument 会替换为你所选身份的 DID 与公钥文档；签名覆盖上述完整 body（含 nonce）。'
 
     const sel = document.createElement('select')
     sel.className = 'sign-key'
@@ -1536,7 +1559,7 @@ function renderSignList(state: State): void {
     })
     actions.append(reject, approve)
 
-    li.append(head, meta, preview, sel, actions)
+    li.append(head, meta, nonceLine, bodyLabel, preview, note, sel, actions)
     list.append(li)
   }
 }

@@ -10,7 +10,6 @@ import {
   deriveKeyPrivateKey,
   buildAwikiIdentity,
   buildHandleAggregateDoc,
-  reproofDidDocumentForAnpLogin,
   signAnpLoginRequest,
   signChallenge,
   isValidMnemonic,
@@ -885,14 +884,13 @@ function refreshBadge() {
 }
 
 function buildPendingState(p: Pending, did: string | null): PendingRequest {
-  let bodyPreview = p.req.body
-  if (bodyPreview.length > 300) bodyPreview = bodyPreview.slice(0, 300) + '…'
   return {
     id: p.id,
     url: p.req.url,
     method: (p.req.method ?? 'POST').toUpperCase(),
     nonce: p.req.nonce,
-    bodyPreview,
+    // The full body: the user must be able to read exactly what they approve.
+    body: p.req.body,
     did: did ?? '',
     pageOrigin: p.pageOrigin,
   }
@@ -1879,15 +1877,16 @@ async function approve(
   }
   if (!identity) return { status: 'error', error: '尚未注册 DID，请先在钱包里注册' }
 
-  // The site pre-builds the request body with the ACTIVE key's didDocument, and
-  // (agentworld's extension connector) without `did` at all. Relying-party
-  // verifiers bind keyid → DID → body.did, and check the inline document's proof
-  // with their own eddsa-jcs-2022 payload, so rebuild both from the signing key.
+  // The site pre-builds the request body with the ACTIVE key's didDocument; if
+  // the user self-selected a DIFFERENT key, that document won't match the
+  // signer's keyid. Always bind the body to the signing identity. `did` is the
+  // field ANP login verifiers check against the keyid's DID; the connector
+  // omits it, so supply it from the identity we actually sign with.
   let finalBody = item.req.body
   try {
     const parsed = JSON.parse(item.req.body) as { did?: unknown; didDocument?: unknown }
     parsed.did = identity.did
-    parsed.didDocument = reproofDidDocumentForAnpLogin(identity.didDocument, priv, identity.keyid)
+    parsed.didDocument = identity.didDocument
     finalBody = JSON.stringify(parsed)
   } catch {
     /* non-JSON body — sign it as-is */

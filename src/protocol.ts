@@ -40,7 +40,7 @@ export interface PendingRequest {
   url: string
   method: string
   nonce: string
-  bodyPreview: string
+  body: string
   did: string
   pageOrigin: string
 }

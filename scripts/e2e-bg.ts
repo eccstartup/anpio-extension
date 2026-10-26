@@ -515,40 +515,6 @@ function assertDocumentProof(doc: Record<string, unknown>): void {
   assert(ed25519.verify(signature, input, publicKey.slice(2)), 'document proof verifies over the manifest')
 }
 
-/**
- * Relying-party verifiers (agentworld's @connectx-sdk/core among them) hash the
- * proof options WITHOUT folding @context, unlike the awiki registration proof.
- * The login body must carry a document proof they accept.
- */
-function assertLoginBodyProof(doc: Record<string, unknown>): void {
-  const proof = must(doc.proof as Record<string, unknown> | undefined, 'login document proof')
-  const proofValue = String(proof.proofValue)
-  assert(proofValue.startsWith('z'), 'login proofValue is base58btc multibase')
-  const vm = must(
-    (doc.verificationMethod as Record<string, unknown>[]).find(
-      (m) => m.id === proof.verificationMethod,
-    ),
-    'login proof verification method resolves',
-  )
-  const publicKey = decodeMultibase(vm.publicKeyMultibase, 'login proof key')
-
-  const { proofValue: _proofValue, ...proofFields } = proof
-  const unsigned: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(doc)) if (key !== 'proof') unsigned[key] = value
-  const signature = base58.decode(proofValue.slice(1))
-  const docHash = sha256(utf8ToBytes(jcsCanonicalize(unsigned)))
-  const check = (options: Record<string, unknown>) => {
-    const input = new Uint8Array(64)
-    input.set(sha256(utf8ToBytes(jcsCanonicalize(options))), 0)
-    input.set(docHash, 32)
-    return ed25519.verify(signature, input, publicKey.slice(2))
-  }
-  assert(check(proofFields), 'login document proof verifies without folding @context')
-  const folded = { ...proofFields }
-  if (unsigned['@context'] !== undefined) folded['@context'] = unsigned['@context']
-  assert(!check(folded), 'login document proof is not the registration (folded) proof')
-}
-
 async function bg<T = any>(msg: Record<string, unknown>): Promise<T> {
   return (await chrome.runtime.sendMessage(msg)) as T
 }
@@ -1141,12 +1107,23 @@ async function main() {
   })
   eq(identityLocked.did, regA.did, 'get-identity works while locked')
 
-  const body = JSON.stringify({ nonce, didDocument: {} })
+  const padding = 'x'.repeat(400)
+  const body = JSON.stringify({ nonce, didDocument: {}, padding })
   const signAck = await bg<Resp<{ id: string }>>({
     type: 'anp-wallet/sign',
     payload: { id: 'req-1', req: { url: TARGET, method: 'POST', body, nonce } },
   })
   eq(signAck.status, 'pending', 'sign stages while locked')
+  st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
+  const staged = must(st.pending[0], 'staged pending request') as {
+    url: string
+    method: string
+    nonce: string
+    body: string
+  }
+  eq(staged.url, TARGET, 'approval UI gets the full target URL')
+  eq(staged.nonce, nonce, 'approval UI gets the nonce')
+  eq(staged.body, body, 'approval UI gets the full untruncated body')
   await waitFor(() => openPopupCalls > 0, 'sign opens the approval UI when nothing is open')
 
   const unlockA = await bg<Resp>({ type: 'anp-wallet/unlock', password })
@@ -1158,8 +1135,11 @@ async function main() {
   const bodyA = JSON.parse((deliveredA.result as { body: string }).body)
   eq(bodyA.did, regA.did, 'delivered body binds the signing DID')
   eq(bodyA.didDocument.id, regA.did, 'delivered body carries the signing DID document')
-  assertLoginBodyProof(bodyA.didDocument)
+  // The inline document is the registered one, with its standard (folded) proof —
+  // the wallet does not fork the cryptosuite to suit a relying party.
+  assertDocumentProof(bodyA.didDocument)
   eq(bodyA.nonce, nonce, 'delivered body keeps the site nonce')
+  eq(bodyA.padding, padding, 'delivered body keeps the rest of the signed content')
 
   // An open side panel acknowledges the ping, so no extra window is opened.
   const popupCallsBefore = openPopupCalls
@@ -1194,7 +1174,7 @@ async function main() {
   const selBody = JSON.parse((deliveredSel.result as { body: string }).body)
   eq(selBody.did, verifiedBDid, 'self-selected body binds the imported DID')
   eq(selBody.didDocument.id, verifiedBDid, 'self-selected body document matches the imported DID')
-  assertLoginBodyProof(selBody.didDocument)
+  assertDocumentProof(selBody.didDocument)
   console.log('signing (mnemonic + imported): ok')
 
   // =========================================================================
