@@ -1881,15 +1881,28 @@ async function approve(
   // the user self-selected a DIFFERENT key, that document won't match the
   // signer's keyid. Always bind the body to the signing identity. `did` is the
   // field ANP login verifiers check against the keyid's DID; the connector
-  // omits it, so supply it from the identity we actually sign with.
+  // omits it, so supply it from the identity we actually sign with. An empty
+  // body on a write method gets the ANP login body built for it.
   let finalBody = item.req.body
-  try {
-    const parsed = JSON.parse(item.req.body) as { did?: unknown; didDocument?: unknown }
-    parsed.did = identity.did
-    parsed.didDocument = identity.didDocument
-    finalBody = JSON.stringify(parsed)
-  } catch {
-    /* non-JSON body — sign it as-is */
+  const method = (item.req.method ?? 'POST').toUpperCase()
+  if (item.req.body.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(item.req.body)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const body = parsed as Record<string, unknown>
+        body.did = identity.did
+        body.didDocument = identity.didDocument
+        finalBody = JSON.stringify(body)
+      }
+    } catch {
+      /* non-JSON body — sign it as-is */
+    }
+  } else if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+    finalBody = JSON.stringify({
+      nonce: item.req.nonce,
+      did: identity.did,
+      didDocument: identity.didDocument,
+    })
   }
 
   try {

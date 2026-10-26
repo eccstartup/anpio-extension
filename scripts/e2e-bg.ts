@@ -1154,6 +1154,23 @@ async function main() {
   await bg({ type: 'anp-wallet/reject', id: 'req-panel' })
   uiAcksPings = false
 
+  // A relying party may sign a request without a body; the wallet builds the
+  // ANP login body instead of signing empty bytes.
+  await bg<Resp<{ id: string }>>({
+    type: 'anp-wallet/sign',
+    payload: { id: 'req-empty', req: { url: TARGET, method: 'POST', body: '', nonce } },
+  })
+  const approveEmpty = await bg<Resp<{ body: string }>>({ type: 'anp-wallet/approve', id: 'req-empty' })
+  eq(approveEmpty.status, 'ok', 'approve a signature without a site body')
+  const deliveredEmpty = must(
+    tabMessages.find((m) => m.id === 'req-empty'),
+    'delivered empty-body signature',
+  )
+  const bodyEmpty = JSON.parse((deliveredEmpty.result as { body: string }).body)
+  eq(bodyEmpty.nonce, nonce, 'constructed body carries the nonce')
+  eq(bodyEmpty.did, regA.did, 'constructed body carries the signing DID')
+  eq(bodyEmpty.didDocument.id, regA.did, 'constructed body carries the signing document')
+
   const signSel = await bg<Resp<{ id: string }>>({
     type: 'anp-wallet/sign',
     payload: { id: 'req-sel', req: { url: TARGET, method: 'POST', body, nonce } },

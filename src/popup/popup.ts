@@ -20,11 +20,11 @@ import type {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-type View = 'secret' | 'unlock' | 'register' | 'home' | 'wallet' | 'sign' | 'servers'
+type View = 'secret' | 'unlock' | 'register' | 'home' | 'wallet' | 'sign' | 'servers' | 'settings'
 type SecretSource = 'generate' | 'mnemonic' | 'key'
 type SecretStep = 'source' | 'recall' | 'meta'
 
-const VIEWS: View[] = ['secret', 'unlock', 'register', 'home', 'wallet', 'sign', 'servers']
+const VIEWS: View[] = ['secret', 'unlock', 'register', 'home', 'wallet', 'sign', 'servers', 'settings']
 
 interface State {
   status: string
@@ -50,7 +50,7 @@ let lastState: State | null = null
 let currentView: View | null = null
 let renderSeq = 0
 
-let manualView: 'secret' | 'servers' | null = null
+let manualView: 'secret' | 'servers' | 'settings' | null = null
 let detailWalletId: string | null = null
 let regWalletId: string | null = null
 
@@ -105,7 +105,7 @@ function short(value: string, max = 54): string {
 
 /** The signing body exactly as sent; pretty-print JSON so it can be read in full. */
 function formatSignBody(body: string): string {
-  if (!body) return '（空 body）'
+  if (!body) return '（网站没有提交请求体；批准后会构造 nonce + did + didDocument）'
   try {
     return JSON.stringify(JSON.parse(body), null, 2)
   } catch {
@@ -210,6 +210,8 @@ async function render(): Promise<void> {
     view = 'secret'
   } else if (manualView === 'servers') {
     view = 'servers'
+  } else if (manualView === 'settings') {
+    view = 'settings'
   } else {
     view = 'home'
   }
@@ -221,6 +223,7 @@ async function render(): Promise<void> {
   else if (view === 'wallet') renderWalletDetail(state)
   else if (view === 'register') renderRegister(state)
   else if (view === 'servers') renderServers(state)
+  else if (view === 'settings') renderSettings(state)
   else if (view === 'sign') renderSignList(state)
 }
 
@@ -228,7 +231,7 @@ function showView(view: View): void {
   if (currentView === 'secret' && view !== 'secret') clearSecretValues()
   if (currentView === 'register' && view !== 'register') leaveRegister()
   if (currentView === 'wallet' && view !== 'wallet') clearAddKeyForm()
-  if (view !== 'home') clearExport()
+  if (view !== 'settings') clearExport()
   for (const v of VIEWS) {
     hide($(`view-${v}`), v !== view)
   }
@@ -574,6 +577,37 @@ function clearExport(): void {
   $('btn-copy-export').textContent = '复制导出内容'
 }
 
+function refreshSettingsControls(state: State): void {
+  const wallet = activeWallet(state)
+  const exportBtn = $('btn-export') as HTMLButtonElement
+  exportBtn.textContent = wallet?.kind === 'imported' ? '导出私钥' : '导出助记词'
+  exportBtn.disabled = !wallet
+  const autoLock = $('auto-lock-select') as HTMLSelectElement
+  if (document.activeElement !== autoLock) autoLock.value = String(state.autoLockMinutes ?? 5)
+}
+
+function renderSettings(state: State): void {
+  refreshSettingsControls(state)
+}
+
+function goSettings(): void {
+  manualView = 'settings'
+  detailWalletId = null
+  regWalletId = null
+  void render()
+}
+
+async function lockNow(): Promise<void> {
+  await send({ type: 'anp-wallet/lock' })
+  manualView = null
+  detailWalletId = null
+  regWalletId = null
+  regDraft = null
+  stopEmailPoll()
+  clearExport()
+  await render()
+}
+
 function renderWalletList(state: State): void {
   const account = state.account!
   const list = $('wallet-list')
@@ -617,12 +651,7 @@ function renderWalletList(state: State): void {
     list.append(li)
   }
 
-  const wallet = activeWallet(state)
-  const exportBtn = $('btn-export') as HTMLButtonElement
-  exportBtn.textContent = wallet?.kind === 'imported' ? '导出私钥' : '导出助记词'
-  exportBtn.disabled = !wallet
-  const autoLock = $('auto-lock-select') as HTMLSelectElement
-  if (document.activeElement !== autoLock) autoLock.value = String(state.autoLockMinutes ?? 5)
+  refreshSettingsControls(state)
   hide($('unlocked-row'), false)
 }
 
@@ -1499,7 +1528,7 @@ function renderSignList(state: State): void {
 
     const bodyLabel = document.createElement('div')
     bodyLabel.className = 'sign-label'
-    bodyLabel.textContent = '待签名内容（网站提交的完整请求体）'
+    bodyLabel.textContent = p.body ? `待签名内容（${p.body.length} 字符）` : '待签名内容'
 
     const preview = document.createElement('pre')
     preview.className = 'sign-body mono'
@@ -1691,16 +1720,11 @@ function wireEvents(): void {
   })
 
   $('btn-add-wallet').addEventListener('click', () => showSecret('add'))
-  $('btn-lock').addEventListener('click', async () => {
-    await send({ type: 'anp-wallet/lock' })
-    manualView = null
-    detailWalletId = null
-    regWalletId = null
-    regDraft = null
-    stopEmailPoll()
-    clearExport()
-    await render()
-  })
+  $('btn-lock').addEventListener('click', () => void lockNow())
+  $('btn-settings').addEventListener('click', goSettings)
+  $('btn-settings-back').addEventListener('click', goHome)
+  $('btn-settings-lock').addEventListener('click', () => void lockNow())
+  $('btn-settings-servers').addEventListener('click', showServers)
   $('btn-export').addEventListener('click', () => void exportSecret())
   $('auto-lock-select').addEventListener('change', () => void setAutoLock())
   $('btn-copy-export').addEventListener('click', () => {
@@ -1720,8 +1744,7 @@ function wireEvents(): void {
     )
   })
 
-  $('btn-servers').addEventListener('click', showServers)
-  $('btn-servers-back').addEventListener('click', goHome)
+  $('btn-servers-back').addEventListener('click', goSettings)
   $('btn-add-server').addEventListener('click', () => void addServer())
 
   $('btn-wallet-back').addEventListener('click', goHome)

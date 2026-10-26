@@ -200,30 +200,51 @@
         <div id="home-head">
           <h2>钱包</h2>
           <div class="home-actions">
-            <button id="btn-servers" title="注册服务器">服务器</button>
+            <button id="btn-settings" title="设置">设置</button>
             <button id="btn-add-wallet" title="添加钱包">＋</button>
           </div>
         </div>
         <ul id="wallet-list"></ul>
 
-        <label class="field" id="auto-lock-field">
-          <span>自动锁定</span>
-          <select id="auto-lock-select">
-            <option value="1">1 分钟</option>
-            <option value="3">3 分钟</option>
-            <option value="5">5 分钟</option>
-            <option value="20">20 分钟</option>
-            <option value="0">立即锁定（关闭钱包面板时）</option>
-          </select>
-        </label>
-        <div id="auto-lock-hint" class="hint"></div>
-
         <div id="unlocked-row" class="row">
           <button id="btn-lock">锁定</button>
-          <button id="btn-export">导出助记词</button>
         </div>
-        <div id="export-box" class="hidden"></div>
-        <button id="btn-copy-export" class="link hidden">复制导出内容</button>
+      </section>
+
+      <!-- ④c 设置：安全、服务器、备份 -->
+      <section id="view-settings" class="view hidden">
+        <button id="btn-settings-back" class="link">← 返回钱包</button>
+        <h2>设置</h2>
+
+        <div class="settings-group">
+          <div class="settings-title">安全</div>
+          <label class="field">
+            <span>自动锁定</span>
+            <select id="auto-lock-select">
+              <option value="1">1 分钟</option>
+              <option value="3">3 分钟</option>
+              <option value="5">5 分钟</option>
+              <option value="20">20 分钟</option>
+              <option value="0">立即锁定（关闭钱包面板时）</option>
+            </select>
+          </label>
+          <div id="auto-lock-hint" class="hint"></div>
+          <button id="btn-settings-lock">立即锁定</button>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-title">服务器</div>
+          <p class="muted">注册身份所用的服务器，默认 awiki.ai。</p>
+          <button id="btn-settings-servers">管理服务器</button>
+        </div>
+
+        <details id="backup-details" class="settings-group">
+          <summary class="settings-title">备份与导出</summary>
+          <p class="muted">导出会直接显示密钥材料，请确认周围无人可见。</p>
+          <button id="btn-export">导出助记词</button>
+          <div id="export-box" class="hidden"></div>
+          <button id="btn-copy-export" class="link hidden">复制导出内容</button>
+        </details>
       </section>
 
       <!-- ④b 钱包详情 -->
