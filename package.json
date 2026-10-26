@@ -1,5 +1,5 @@
 {
-  "name": "anp-extension",
+  "name": "anpio-extension",
   "version": "0.1.0",
   "private": true,
   "description": "ANP Agent Network Protocol wallet as a Chrome extension (Route B)",
