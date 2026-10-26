@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>ANP Wallet</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <span class="dot"></span>
+      <h1>ANP Wallet</h1>
+      <span id="lock-pill" class="pill">—</span>
+    </header>
+
+    <main>
+      <!-- ① 生成/导入助记词（首个钱包） -->
+      <section id="view-create" class="view hidden">
+        <h2>创建钱包</h2>
+        <p class="muted">生成或导入助记词，并设置本地加密密码。这是你的第一个钱包，之后可在设置里继续添加。</p>
+        <label class="field">
+          <span>助记词（24 词 / 256-bit 熵，由系统 CSPRNG 生成）</span>
+          <textarea id="mnemonic" rows="3" placeholder="abandon … about"></textarea>
+        </label>
+        <div class="row">
+          <button id="btn-generate">随机生成 24 词</button>
+        </div>
+        <label class="field">
+          <span>钱包密码（全局，加密所有钱包的助记词）</span>
+          <input id="wallet-password" type="password" autocomplete="new-password" />
+        </label>
+        <button id="btn-create" class="primary">创建并加密</button>
+        <div id="create-err" class="err"></div>
+      </section>
+
+      <!-- ①b 添加另一个钱包 -->
+      <section id="view-addwallet" class="view hidden">
+        <h2>添加钱包</h2>
+        <p class="muted">每个钱包是一把独立助记词，用上面的全局密码加密。可填 handle 来绑定首个身份。</p>
+        <label class="field">
+          <span>助记词（24 词）</span>
+          <textarea id="add-mnemonic" rows="3" placeholder="abandon … about"></textarea>
+        </label>
+        <div class="row">
+          <button id="btn-addwallet-generate">随机生成 24 词</button>
+        </div>
+        <label class="field">
+          <span>Handle（可选，只填名字，自动补 .localhost）</span>
+          <input id="add-handle" placeholder="work" spellcheck="false" />
+        </label>
+        <button id="btn-addwallet-add" class="primary">添加并加密</button>
+        <div id="addwallet-err" class="err"></div>
+        <button id="btn-addwallet-back" class="link">返回</button>
+      </section>
+
+      <!-- ② 解锁 -->
+      <section id="view-unlock" class="view hidden">
+        <h2>解锁钱包</h2>
+        <p class="muted">助记词已加密保存在本地，输入全局钱包密码解锁。</p>
+        <label class="field">
+          <span>钱包密码</span>
+          <input id="unlock-password" type="password" autocomplete="current-password" />
+        </label>
+        <button id="btn-unlock" class="primary">解锁</button>
+        <div id="unlock-err" class="err"></div>
+      </section>
+
+      <!-- ③ 注册 DID -->
+      <section id="view-register" class="view hidden">
+        <h2>注册身份</h2>
+        <p class="muted">用这个钱包的主密钥签名，把 handle 下所有密钥聚合注册，无需短信/邮箱验证。</p>
+
+        <div class="field">
+          <span>主密钥</span>
+          <div id="reg-primary-did" class="muted mono"></div>
+        </div>
+
+        <label class="field">
+          <span>Handle（只填名字，自动补 .localhost，例如 alice）</span>
+          <input id="reg-handle" placeholder="alice" spellcheck="false" />
+        </label>
+
+        <button id="btn-register" class="primary">注册</button>
+        <div id="reg-status" class="err"></div>
+        <button id="btn-register-back" class="link">返回</button>
+      </section>
+
+      <!-- ④ 主界面：钱包/handle 列表 -->
+      <section id="view-home" class="view hidden">
+        <div id="home-head">
+          <h2>钱包</h2>
+          <button id="btn-add-wallet" title="添加钱包">＋</button>
+        </div>
+        <ul id="wallet-list"></ul>
+
+        <div id="unlocked-row" class="row">
+          <button id="btn-lock">锁定</button>
+          <button id="btn-export">导出助记词</button>
+        </div>
+        <div id="export-box" class="hidden"></div>
+      </section>
+
+      <!-- ④b 钱包详情：handle + 密钥管理 -->
+      <section id="view-wallet" class="view hidden">
+        <button id="btn-wallet-back" class="link">← 返回列表</button>
+        <div id="wallet-head">
+          <div id="wallet-label"></div>
+          <button id="btn-wallet-rename" class="link" title="重命名">重命名</button>
+          <span id="wallet-primary" class="pill primary">主</span>
+          <span id="wallet-pill" class="pill">0 密钥</span>
+        </div>
+        <div id="wallet-handle" class="muted"></div>
+
+        <div class="row">
+          <button id="btn-wallet-register" class="primary">注册</button>
+        </div>
+
+        <ul id="key-list"></ul>
+
+        <div class="row">
+          <button id="btn-add-key" class="primary">＋ 添加密钥</button>
+        </div>
+
+        <div class="row">
+          <button id="btn-wallet-delete" class="link">删除这个钱包</button>
+        </div>
+      </section>
+
+      <!-- ⑤ 签名确认 -->
+      <section id="view-sign" class="view hidden">
+        <h2>签名请求确认</h2>
+        <p class="muted">网站请求你用 ANP 身份签名登录：</p>
+        <ul id="sign-list"></ul>
+      </section>
+    </main>
+
+    <footer>协议：ANP-03 · RFC 9421 · e1（Ed25519/Multikey）</footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

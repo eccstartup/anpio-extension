@@ -1,0 +1,30 @@
+{
+  "name": "anp-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ANP Agent Network Protocol wallet as a Chrome extension (Route B)",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "verify": "tsx scripts/verify-anp.ts",
+    "verify:bg": "tsx scripts/e2e-bg.ts"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "@noble/hashes": "^1.4.0",
+    "@scure/base": "^1.1.9",
+    "@scure/bip39": "^1.3.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "@types/node": "^26.4.0",
+    "esbuild": "^0.23.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  },
+  "allowScripts": {
+    "esbuild@0.23.1": true,
+    "esbuild@0.28.2": true
+  }
+}
