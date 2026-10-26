@@ -130,6 +130,8 @@ export interface Wallet {
   keys: StoredKey[]
   /** Set once the handle has been registered on the bound server. */
   registered?: boolean
+  /** Server-issued account id returned by register/lookup (not a credential). */
+  userId?: string
   /** The last submitted DID document (did_document) or aggregate ad.json. */
   handleDocuments?: Record<string, unknown>
   /** Bound registration server; null for legacy localhost wallets. */

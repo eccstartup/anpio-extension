@@ -1,4 +1,5 @@
 import {
+  awikiDidForHandle,
   buildAwikiIdentity,
   generateMnemonicPhrase,
   isValidMnemonic,
@@ -653,6 +654,12 @@ function renderWalletDetail(state: State): void {
   $('wallet-handle').textContent = wallet.handle
     ? `${wallet.handle} · DID 域 ${wallet.didDomain}`
     : `未注册 handle · DID 域 ${wallet.didDomain}`
+  $('wallet-identity').textContent = [
+    primary ? `主 DID：${primary.did}` : '',
+    wallet.userId ? `账号 ID：${wallet.userId}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
 
   const badges = $('wallet-badges')
   clear(badges)
@@ -887,7 +894,14 @@ function renderRegister(state: State): void {
     hide(form, true)
     $('reg-done-handle').textContent = wallet.handle || '—'
     $('reg-done-did').textContent = primary?.did || '—'
+    $('reg-done-server').textContent = aggregate
+      ? 'localhost（旧本地 open-server）'
+      : server
+        ? `${server.label} · ${server.didDomain}`
+        : `${wallet.serverId ?? '—'} · ${wallet.didDomain}`
+    $('reg-done-user').textContent = wallet.userId || '—'
     $('reg-done-mode').textContent = aggregate ? '旧聚合 ad.json' : '单 DID 文档'
+    $('reg-done-copy-hint').textContent = ''
     stopEmailPoll()
     return
   }
@@ -935,7 +949,7 @@ function renderRegister(state: State): void {
 
   $('reg-note').textContent = aggregate
     ? '旧聚合模式：提交 handle 级别的 ad.json；邮箱可选，不启用邮箱验证。'
-    : '注册会把主 DID 绑定到这个 handle；邮箱只用于本次注册，不会保存。'
+    : '邮件里的链接只验证邮箱；点“注册”才会把 DID 绑定到该 handle。邮箱只用于本次注册，不会保存。'
 
   const handleEl = input('reg-handle')
   if (document.activeElement !== handleEl) handleEl.value = draft.handle
@@ -978,6 +992,25 @@ function updateRegHandlePreview(): void {
   if (!raw) el.textContent = `完整 handle：${regDomain(ctx)}（填写后显示）`
   else if (!parsed.valid) el.textContent = 'Handle 只能包含小写字母、数字和连字符（1–63 字符）'
   else el.textContent = `完整 handle：${parsed.full}`
+
+  const didEl = $('reg-did-preview')
+  const primary = ctx.wallet.keys[ctx.wallet.primaryKeyIndex]
+  if (ctx.aggregate || !raw || !parsed.valid || !primary) {
+    didEl.textContent = ''
+    hide(didEl, true)
+  } else {
+    try {
+      const did = awikiDidForHandle(parsed.local, regDomain(ctx), primary.publicKeyMultibase)
+      didEl.textContent =
+        did === primary.did
+          ? `将注册的 DID：${did}`
+          : `将注册的 DID：${did}\n当前主 DID：${primary.did}（点“注册”后按 handle 重建）`
+      hide(didEl, false)
+    } catch {
+      didEl.textContent = ''
+      hide(didEl, true)
+    }
+  }
   updateRegAvailability()
 }
 
@@ -1030,8 +1063,8 @@ async function checkEmailStatus(silent: boolean): Promise<void> {
       draft.verified = resp.verified === true
       const at = typeof resp.verifiedAt === 'string' ? `（${resp.verifiedAt}）` : ''
       draft.note = draft.verified
-        ? `邮箱已验证${at}`
-        : '邮箱尚未验证，请点击邮件中的激活链接'
+        ? `邮箱已验证${at}，点“注册”后才会把 DID 绑定到 ${parsed.full}`
+        : '邮箱尚未验证，请点击邮件中的激活链接（点链接只验证邮箱，不会注册身份）'
       setRegEmailStatus(draft.note, draft.verified ? 'ok' : 'warn')
       if (draft.verified) stopEmailPoll()
     } else if (resp.status === 'unsupported') {
@@ -1071,7 +1104,7 @@ async function sendEmailVerification(): Promise<void> {
     })
     if (resp.status === 'ok') {
       draft.verified = null
-      draft.note = '验证邮件已发送，请到邮箱点击激活链接；本页会自动检查 3 分钟。'
+      draft.note = '验证邮件已发送：点邮件里的链接只验证邮箱；回到本页点“注册”才会绑定 DID。本页会自动检查 3 分钟。'
       setRegEmailStatus(draft.note, 'muted')
       startEmailPoll(ctx.wallet.id)
     } else if (resp.status === 'unsupported') {
@@ -1767,6 +1800,12 @@ function wireEvents(): void {
   $('btn-email-send').addEventListener('click', () => void sendEmailVerification())
   $('btn-email-check').addEventListener('click', () => void checkEmailStatus(false))
   $('btn-register').addEventListener('click', () => void submitRegister())
+  $('btn-copy-reg-did').addEventListener('click', () => {
+    const ctx = regContext()
+    const did = ctx?.wallet.keys[ctx.wallet.primaryKeyIndex]?.did
+    if (!did) return
+    copyText(did, $('reg-done-copy-hint'), 'DID 已复制')
+  })
   $('btn-verify-existing').addEventListener('click', () => void verifyExisting())
   $('btn-rebind').addEventListener('click', () => void rebindServer())
 }

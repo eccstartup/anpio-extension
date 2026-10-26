@@ -138,9 +138,15 @@
             <dd id="reg-done-handle" class="mono"></dd>
             <dt>DID</dt>
             <dd id="reg-done-did" class="mono"></dd>
+            <dt>服务器</dt>
+            <dd id="reg-done-server"></dd>
+            <dt>账号 ID</dt>
+            <dd id="reg-done-user" class="mono"></dd>
             <dt>模式</dt>
             <dd id="reg-done-mode"></dd>
           </dl>
+          <button id="btn-copy-reg-did" class="link">复制 DID</button>
+          <span id="reg-done-copy-hint" class="hint"></span>
         </div>
 
         <div id="reg-form">
@@ -163,6 +169,7 @@
               <input id="reg-handle" placeholder="alice" spellcheck="false" autocomplete="off" />
             </label>
             <div id="reg-full-handle" class="hint"></div>
+            <div id="reg-did-preview" class="hint mono"></div>
 
             <div id="reg-email-field">
               <label class="field">
@@ -218,6 +225,7 @@
         </div>
         <div id="wallet-badges" class="badges"></div>
         <div id="wallet-handle" class="muted"></div>
+        <div id="wallet-identity" class="hint mono"></div>
 
         <div class="row">
           <button id="btn-wallet-register" class="primary">注册身份</button>

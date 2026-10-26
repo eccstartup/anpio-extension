@@ -329,6 +329,7 @@ interface WalletLike {
   primaryKeyIndex: number
   keys: KeyLike[]
   registered?: boolean
+  userId?: string
   handleDocuments?: Record<string, unknown>
   serverId: string | null
   didDomain: string
@@ -895,6 +896,7 @@ async function main() {
   st = await bg<StateLike>({ type: 'anp-wallet/get-state' })
   walletB = walletFrom(st, walletBId)
   eq(walletB.registered, true, 'wallet marked registered after verify')
+  eq(walletB.userId, 'user-existing', 'verify-existing persists the server account id')
   eq(walletB.handle, fullMatch, 'wallet handle after verify')
   eq(walletB.keys[0].registered, true, 'primary key registered')
   eq(walletB.keys[0].did, candidateB.did, 'DID re-minted with the handle')
@@ -1022,6 +1024,7 @@ async function main() {
   eq(walletA.keys[walletA.primaryKeyIndex].registered, true, 'primary key registered')
   eq(walletA.keys.filter((k) => !k.registered).length, 1, 'second key unregistered')
   eq(walletA.handle, fullHandleA, 'wallet handle written back')
+  eq(walletA.userId, 'user-1', 'register persists the server account id')
   eq(walletA.activeKeyIndex, walletA.primaryKeyIndex, 'active key is primary after register')
   eq(walletA.didDomain, 'awiki.ai', 'registered wallet domain')
   const didLocal = regA.did.split(':')[4]

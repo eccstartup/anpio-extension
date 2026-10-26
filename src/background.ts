@@ -741,6 +741,7 @@ interface DidRegisterResult {
   primaryPos: number
   fullHandle: string
   did: string
+  userId?: string
 }
 
 async function submitDidDocumentRegister(
@@ -782,7 +783,14 @@ async function submitDidDocumentRegister(
   if (result.did !== primary.did) {
     throw new Error('服务器返回的 DID 与提交的 DID 不一致')
   }
-  return { keys: rebuilt, primary, primaryPos, fullHandle, did: primary.did }
+  return {
+    keys: rebuilt,
+    primary,
+    primaryPos,
+    fullHandle,
+    did: primary.did,
+    userId: typeof result.user_id === 'string' ? result.user_id : undefined,
+  }
 }
 
 interface AggregateRegisterResult {
@@ -1367,6 +1375,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
           wallet.handleDocuments = r.ad
           wallet.didDomain = server.didDomain
           wallet.registerMode = 'aggregate'
+          if (r.userId) wallet.userId = r.userId
           account.activeWalletId = wallet.id
           wallet.activeKeyIndex = primaryPos
           await saveAccount(account)
@@ -1395,6 +1404,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
         wallet.handle = r.fullHandle
         wallet.registered = true
         wallet.handleDocuments = r.primary.didDocument
+        if (r.userId) wallet.userId = r.userId
         wallet.serverId = server.id
         wallet.didDomain = server.didDomain
         wallet.registerMode = 'did_document'
@@ -1444,7 +1454,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
         const primaryPriv = privateKeyFor(wallet, primaryKey, secret)
         const candidate = mintStoredKey(primaryPriv, primaryKey.index, fullHandle, server.didDomain, service)
 
-        let lookup: { did?: string; status?: string }
+        let lookup: { did?: string; status?: string; user_id?: string }
         try {
           lookup = await lookupHandle(server, fullHandle)
         } catch (e) {
@@ -1483,6 +1493,7 @@ async function handle(msg: BgRequest, sender: chrome.runtime.MessageSender): Pro
         wallet.serverId = server.id
         wallet.didDomain = server.didDomain
         wallet.registerMode = 'did_document'
+        if (typeof lookup.user_id === 'string') wallet.userId = lookup.user_id
         account.activeWalletId = wallet.id
         wallet.activeKeyIndex = primaryPos
         await saveAccount(account)

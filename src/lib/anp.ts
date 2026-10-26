@@ -537,6 +537,23 @@ function buildDeviceDeclaration(did: string): {
   }
 }
 
+/**
+ * The DID that registering `<local>.<didDomain>` will bind, computed from the
+ * stored Ed25519 Multikey alone (no private key needed for UI previews).
+ */
+export function awikiDidForHandle(
+  localPart: string,
+  didDomain: string,
+  publicKeyMultibase: string,
+): string {
+  if (!publicKeyMultibase.startsWith('z')) throw new Error('公钥不是 multibase z 编码')
+  const raw = base58.decode(publicKeyMultibase.slice(1))
+  if (raw.length !== 34 || raw[0] !== 0xed || raw[1] !== 0x01) {
+    throw new Error('公钥不是 Ed25519 Multikey')
+  }
+  return `did:wba:${didDomain}:user:${localPart}:e1_${computeMultikeyFingerprint(raw.slice(2))}`
+}
+
 export function buildAwikiIdentity(
   handle: string,
   priv: Uint8Array,
