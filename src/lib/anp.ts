@@ -10,7 +10,7 @@
 
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39'
 import { wordlist } from '@scure/bip39/wordlists/english'
-import { ed25519 } from '@noble/curves/ed25519'
+import { ed25519, x25519 } from '@noble/curves/ed25519'
 import { sha256 } from '@noble/hashes/sha256'
 import { sha512 } from '@noble/hashes/sha512'
 import { hmac } from '@noble/hashes/hmac'
@@ -119,6 +119,15 @@ export function publicKeyFromPrivateKey(priv: Uint8Array): Uint8Array {
 export function multibaseEd25519(pub: Uint8Array): string {
   const prefixed = new Uint8Array(34)
   prefixed[0] = 0xed
+  prefixed[1] = 0x01
+  prefixed.set(pub, 2)
+  return 'z' + base58.encode(prefixed)
+}
+
+/** `z` + base58btc(`0xec 0x01` + 32 raw X25519 public-key bytes). */
+export function multibaseX25519(pub: Uint8Array): string {
+  const prefixed = new Uint8Array(34)
+  prefixed[0] = 0xec
   prefixed[1] = 0x01
   prefixed.set(pub, 2)
   return 'z' + base58.encode(prefixed)
@@ -465,6 +474,69 @@ export interface AwikiMessageService extends Record<string, unknown> {
   serviceDid: string
 }
 
+/**
+ * awiki release 0714 rejects registration documents without exactly one
+ * `ANPDeviceManifest` device. The ANP SDK requires that device to carry a
+ * distinct Ed25519 signing method and X25519 key-agreement method, both
+ * referenced from the verification relationships.
+ *
+ * This wallet is identity-only: it never performs device assertions or E2EE.
+ * The two device public keys are generated here and their private halves are
+ * zeroed immediately. Only public key material reaches the signed document —
+ * no device or communication private key is stored or usable.
+ */
+const DEVICE_MANIFEST_ID = 'device-1'
+const DEVICE_PROFILES = [
+  'anp.core.binding.v1',
+  'anp.identity.discovery.v1',
+  'anp.direct.base.v1',
+  'anp.group.base.v2',
+]
+
+function buildDeviceDeclaration(did: string): {
+  signingKeyId: string
+  verificationMethods: Record<string, unknown>[]
+  manifest: Record<string, unknown>
+} {
+  const signingPriv = ed25519.utils.randomPrivateKey()
+  const signingPub = ed25519.getPublicKey(signingPriv)
+  signingPriv.fill(0)
+  const e2eePriv = x25519.utils.randomPrivateKey()
+  const e2eePub = x25519.getPublicKey(e2eePriv)
+  e2eePriv.fill(0)
+
+  const signingKeyId = `${did}#${DEVICE_MANIFEST_ID}-sign`
+  const e2eeKeyId = `${did}#${DEVICE_MANIFEST_ID}-e2ee`
+  return {
+    signingKeyId,
+    verificationMethods: [
+      {
+        id: signingKeyId,
+        type: 'Multikey',
+        controller: did,
+        publicKeyMultibase: multibaseEd25519(signingPub),
+      },
+      {
+        id: e2eeKeyId,
+        type: 'Multikey',
+        controller: did,
+        publicKeyMultibase: multibaseX25519(e2eePub),
+      },
+    ],
+    manifest: {
+      type: 'ANPDeviceManifest',
+      devices: [
+        {
+          device_id: DEVICE_MANIFEST_ID,
+          signing_key_id: signingKeyId,
+          e2ee_key_id: e2eeKeyId,
+          profiles: [...DEVICE_PROFILES],
+        },
+      ],
+    },
+  }
+}
+
 export function buildAwikiIdentity(
   handle: string,
   priv: Uint8Array,
@@ -492,6 +564,9 @@ export function buildAwikiIdentity(
     services.push({ ...messageService, id: `${did}#message`, type: 'ANPMessageService' })
   }
 
+  const device = buildDeviceDeclaration(did)
+  const deviceEntry = (device.manifest.devices as Record<string, unknown>[])[0]
+
   const doc: Record<string, unknown> = {
     '@context': [
       'https://www.w3.org/ns/did/v1',
@@ -499,9 +574,14 @@ export function buildAwikiIdentity(
       'https://w3id.org/security/multikey/v1',
     ],
     id: did,
-    verificationMethod: [{ id: keyid, type: 'Multikey', controller: did, publicKeyMultibase }],
-    authentication: [keyid],
-    assertionMethod: [keyid],
+    verificationMethod: [
+      { id: keyid, type: 'Multikey', controller: did, publicKeyMultibase },
+      ...device.verificationMethods,
+    ],
+    authentication: [keyid, device.signingKeyId],
+    assertionMethod: [keyid, device.signingKeyId],
+    keyAgreement: [deviceEntry.e2ee_key_id],
+    deviceManifest: device.manifest,
     service: services,
   }
   doc.proof = signDidDocumentProof(doc, priv, keyid, { domain: didDomain, challenge: randomHex(16) })

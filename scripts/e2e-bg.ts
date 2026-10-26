@@ -5,10 +5,14 @@
 // This exercises the same built artifact the browser loads, not just the source.
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
+import { ed25519 } from '@noble/curves/ed25519'
+import { sha256 } from '@noble/hashes/sha256'
+import { utf8ToBytes } from '@noble/hashes/utils'
 import { base58, base64, base64urlnopad } from '@scure/base'
 import {
   buildAwikiIdentity,
   generateMnemonicPhrase,
+  jcsCanonicalize,
   multibaseEd25519,
   parseEd25519PrivateKey,
   publicKeyFromPrivateKey,
@@ -204,6 +208,20 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promis
     if (rpc.method === 'register') {
       const params = rpc.params ?? {}
       if (params.did_document) {
+        const doc = params.did_document as Record<string, unknown>
+        if (!doc.deviceManifest) {
+          // awiki release 0714: no manifest, no registration (error seen live).
+          return json({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            error: {
+              code: -32004,
+              message: 'awiki register: Release 0714 registration requires a one-device Manifest.',
+            },
+          })
+        }
+        assertDeviceManifest(doc)
+        assertDocumentProof(doc)
         didRegisters.push(call)
         return json({
           jsonrpc: '2.0',
@@ -350,6 +368,118 @@ const assertThrows = (fn: () => unknown, substr: string, msg: string) => {
     return
   }
   throw new Error('ASSERT FAILED: ' + msg + ' (no error thrown)')
+}
+
+/**
+ * Every stored DID document must be a valid one-device manifest document with
+ * a proof over the whole document, and must contain only public key material.
+ */
+function assertStoredDocumentsSafe(account: AccountLike): number {
+  let checked = 0
+  for (const wallet of account.wallets) {
+    const doc = wallet.handleDocuments
+    if (!doc || !doc.deviceManifest) continue
+    checked++
+    assertDeviceManifest(doc)
+    assertDocumentProof(doc)
+    const docText = JSON.stringify(doc)
+    assert(!docText.includes('privateKey'), 'stored DID document has no private key field')
+    assert(!/\{"kty":"[^"]*","crv":[^}]*"d":/.test(docText), 'stored DID document has no JWK private scalar')
+  }
+  return checked
+}
+
+function decodeMultibase(value: unknown, msg: string): Uint8Array {
+  const text = String(value)
+  assert(text.startsWith('z'), `${msg}: publicKeyMultibase must be base58btc`)
+  return base58.decode(text.slice(1))
+}
+
+/**
+ * Mirror the awiki/ANP one-device manifest contract locally. Production
+ * (release 0714) rejects registration documents without exactly one device, so
+ * the mock register route enforces the same shape instead of accepting any doc.
+ */
+function assertDeviceManifest(doc: Record<string, unknown>): void {
+  const manifest = must(
+    doc.deviceManifest as { type?: unknown; devices?: Record<string, unknown>[] } | undefined,
+    'DID document declares a deviceManifest',
+  )
+  eq(manifest.type, 'ANPDeviceManifest', 'device manifest type')
+  eq(manifest.devices?.length, 1, 'manifest declares exactly one device')
+  const device = must(manifest.devices?.[0], 'manifest device entry')
+  eqJson(
+    Object.keys(device).sort(),
+    ['device_id', 'e2ee_key_id', 'profiles', 'signing_key_id'],
+    'device entry has only the closed ANP fields',
+  )
+  assert(typeof device.device_id === 'string' && device.device_id.length > 0, 'device_id non-empty')
+  const profiles = device.profiles as string[]
+  assert(Array.isArray(profiles) && profiles.length > 0, 'device profiles non-empty')
+  for (const required of ['anp.core.binding.v1', 'anp.identity.discovery.v1']) {
+    assert(profiles.includes(required), `device declares ${required}`)
+  }
+  assert(
+    !profiles.some((p) => p.includes('.e2ee.')),
+    'identity-only device does not claim E2EE profiles',
+  )
+
+  const did = String(doc.id)
+  const rootId = `${did}#key-1`
+  assert(device.signing_key_id !== rootId, 'device signing key is not the root key')
+  assert(device.e2ee_key_id !== rootId, 'device e2ee key is not the root key')
+  assert(device.signing_key_id !== device.e2ee_key_id, 'device signing and e2ee keys differ')
+
+  const methods = doc.verificationMethod as Record<string, unknown>[]
+  eq(methods.length, 3, 'document has root, device signing and device e2ee methods')
+  const byId = new Map(methods.map((m) => [String(m.id), m]))
+  const root = must(byId.get(rootId), 'root verification method')
+  const signing = must(byId.get(String(device.signing_key_id)), 'device signing method')
+  const e2ee = must(byId.get(String(device.e2ee_key_id)), 'device e2ee method')
+  for (const method of [root, signing, e2ee]) eq(method.controller, did, 'method controller is the DID')
+  assert(!('publicKeyJwk' in root), 'root key has no JWK private material')
+
+  const rootKey = decodeMultibase(root.publicKeyMultibase, 'root')
+  const signingKey = decodeMultibase(signing.publicKeyMultibase, 'device signing')
+  const e2eeKey = decodeMultibase(e2ee.publicKeyMultibase, 'device e2ee')
+  eq(rootKey.length, 34, 'root multikey length')
+  eq(signingKey.length, 34, 'device signing multikey length')
+  eq(e2eeKey.length, 34, 'device e2ee multikey length')
+  eq(rootKey[0], 0xed, 'root is Ed25519')
+  eq(rootKey[1], 0x01, 'root multicodec')
+  eq(signingKey[0], 0xed, 'device signing is Ed25519')
+  eq(signingKey[1], 0x01, 'device signing multicodec')
+  eq(e2eeKey[0], 0xec, 'device e2ee is X25519')
+  eq(e2eeKey[1], 0x01, 'device e2ee multicodec')
+  const materials = [rootKey, signingKey, e2eeKey].map((b) => seedHex(b.slice(2)))
+  eq(new Set(materials).size, 3, 'root/device signing/e2ee public material are distinct')
+
+  eqJson(doc.authentication, [rootId, device.signing_key_id], 'authentication binds root + device signing')
+  eqJson(doc.assertionMethod, [rootId, device.signing_key_id], 'assertionMethod binds root + device signing')
+  eqJson(doc.keyAgreement, [device.e2ee_key_id], 'keyAgreement references only the device e2ee key')
+}
+
+/** Verify the eddsa-jcs-2022 proof over the final document (including manifest). */
+function assertDocumentProof(doc: Record<string, unknown>): void {
+  const proof = must(doc.proof as Record<string, unknown> | undefined, 'document proof')
+  const proofValue = String(proof.proofValue)
+  assert(proofValue.startsWith('z'), 'proofValue is base58btc multibase')
+  const vmId = String(proof.verificationMethod)
+  const vm = must(
+    (doc.verificationMethod as Record<string, unknown>[]).find((m) => m.id === vmId),
+    'proof verification method resolves',
+  )
+  const publicKey = decodeMultibase(vm.publicKeyMultibase, 'proof key')
+  eq(publicKey[0], 0xed, 'proof key is Ed25519')
+
+  const { proofValue: _proofValue, ...options } = proof
+  const unsigned: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(doc)) if (key !== 'proof') unsigned[key] = value
+  const input = new Uint8Array(64)
+  input.set(sha256(utf8ToBytes(jcsCanonicalize(options))), 0)
+  input.set(sha256(utf8ToBytes(jcsCanonicalize(unsigned))), 32)
+  const signature = base58.decode(proofValue.slice(1))
+  assert(ed25519.verify(signature, input, publicKey.slice(2)), 'document proof verifies over the manifest')
 }
 
 async function bg<T = any>(msg: Record<string, unknown>): Promise<T> {
@@ -863,15 +993,36 @@ async function main() {
 
   const docA = must(walletA.handleDocuments, 'wallet A stored DID document')
   eq(docA.id, regA.did, 'stored document id')
-  const vmA = docA.verificationMethod as unknown[]
-  eq(vmA.length, 1, 'DID document has one identity verification method')
-  assert(!('keyAgreement' in docA), 'identity-only document has no keyAgreement')
+  assertDeviceManifest(docA)
+  assertDocumentProof(docA)
   eqJson(serviceIn(docA), expectedService(MOCK_SERVICE, regA.did), 'submitted service is verbatim')
   const proofA = docA.proof as Record<string, unknown>
   eq(proofA.type, 'DataIntegrityProof', 'proof type')
   eq(proofA.cryptosuite, 'eddsa-jcs-2022', 'proof cryptosuite')
   eq(proofA.domain, 'awiki.ai', 'proof domain')
+  eq(proofA.verificationMethod, `${regA.did}#key-1`, 'proof signed by the root key')
   assert(String(proofA.proofValue).startsWith('z'), 'proofValue is base58 multibase')
+  const rootVm = (docA.verificationMethod as Record<string, unknown>[])[0]
+  eq(rootVm.publicKeyMultibase, walletA.keys[walletA.primaryKeyIndex].publicKeyMultibase, 'root key is the identity key')
+  assert(!('privateKeyMultibase' in rootVm) && !('publicKeyJwk' in rootVm), 'no private/JWK material in the document')
+  assert(assertStoredDocumentsSafe(rawAccount()) >= 1, 'the registered DID document is manifest-valid and public-only')
+
+  // Production rejects manifest-less docs with -32004; tampering with the
+  // manifest must also break the proof over the whole document.
+  const strippedDoc = structuredClone(docA)
+  delete strippedDoc.deviceManifest
+  assertThrows(
+    () => assertDeviceManifest(strippedDoc),
+    'deviceManifest',
+    'manifest-less document rejected locally with the production rule',
+  )
+  const tamperedDoc = structuredClone(docA)
+  ;(tamperedDoc.deviceManifest as Record<string, unknown>).devices = []
+  assertThrows(
+    () => assertDocumentProof(tamperedDoc),
+    'document proof verifies',
+    'tampering with the manifest invalidates the proof',
+  )
 
   const jsonAfterReg = rawJson()
   assert(!jsonAfterReg.includes('tester@example.com'), 'account must not persist the email')
@@ -1007,6 +1158,7 @@ async function main() {
     expectedService(serviceFor('reg.example.test'), regH.did),
     'custom service descriptor is verbatim',
   )
+  assert(assertStoredDocumentsSafe(rawAccount()) >= 2, 'registered DID documents are manifest-valid and public-only')
   console.log('custom server rebind + register: ok')
 
   // =========================================================================
@@ -1166,8 +1318,7 @@ async function main() {
   const finalJson = rawJson()
   assert(!finalJson.includes('accessToken'), 'final account has no accessToken')
   assert(!finalJson.includes('legacy-token'), 'final account has no aggregate access token')
-  assert(!finalJson.includes('keyAgreement'), 'final account has no keyAgreement')
-  assert(!finalJson.includes('X25519'), 'final account has no X25519 material')
+  eq(finalJson.includes('secret-token'), false, 'access token never persisted')
 
   const delLast = await bg<Resp>({ type: 'anp-wallet/delete-wallet', walletId: agg.id })
   eq(delLast.status, 'ok', 'delete the last wallet')

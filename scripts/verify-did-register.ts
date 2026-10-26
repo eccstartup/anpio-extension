@@ -114,6 +114,12 @@ async function main() {
 
   const identity = buildAwikiIdentity(fullHandle, priv, didDomain, messageService)
   console.log('  did    :', identity.did)
+  const manifest = identity.didDocument.deviceManifest as
+    | { devices?: { device_id?: string; profiles?: string[] }[] }
+    | undefined
+  const device = manifest?.devices?.[0]
+  if (!device) fail('DID document lacks the one-device manifest required by release 0714')
+  console.log('  device :', device.device_id, `(${(device.profiles ?? []).join(', ')})`)
 
   if (mode === 'did_document') {
     const result = await registerDidDocument(server, local, email, identity.didDocument, invite)
